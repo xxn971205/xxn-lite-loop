@@ -1,0 +1,32 @@
+name: 机制优化提案（Mechanism Proposal）
+description: 反馈 xxn-lite-loop 推进流程、门禁、巡检或复盘机制的通用改进建议（支持直接粘贴 loopctl retro 生成的脱敏草稿）
+labels: ["proposal", "needs-triage"]
+body:
+  - type: textarea
+    id: metrics
+    attributes:
+      label: 1. 客观运行数据（已脱敏）
+      placeholder: "例如：档位 L3 / MR 数量 / 首次过审率 / 重复纠偏类型与次数"
+    validations:
+      required: true
+  - type: textarea
+    id: root_cause
+    attributes:
+      label: 2. 第一性原理根因分析
+      placeholder: "问题卡在哪个环节？为什么不是偶发意外或个人习惯，而是 Loop 机制本身缺位？"
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 3. 建议改法（优先脚本/配置而非堆叠 Prompt）
+      placeholder: "描述最小改动方案，以及预期收益与潜在摩擦成本"
+    validations:
+      required: true
+  - type: textarea
+    id: cleanup
+    attributes:
+      label: 4. 可合并或删除的旧规则（防膨胀自查）
+      placeholder: "新增本机制后，有没有可简化的旧规则？无则写「无」"
+    validations:
+      required: false

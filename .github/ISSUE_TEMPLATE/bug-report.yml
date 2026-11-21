@@ -1,0 +1,18 @@
+name: Bug 报告
+description: 反馈脚本报错、门禁误拦/漏拦或 Hook 误伤正常命令的问题
+labels: ["bug", "needs-triage"]
+body:
+  - type: input
+    id: env
+    attributes:
+      label: 运行环境
+      placeholder: "例如：macOS / Node 22 / GitLab(glab) 或 GitHub(gh) / T3 Code 或 Codex"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现命令与现象（请脱敏业务信息）
+      placeholder: "贴出触发的命令、实际输出与预期行为"
+    validations:
+      required: true
