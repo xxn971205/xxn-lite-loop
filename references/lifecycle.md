@@ -19,6 +19,7 @@
   - `workHours`: 如 `09:00-19:00` + `timezone: Asia/Shanghai`
   - `roleModels`: 抽象角色映射（`controller` / `planner` / `coder` / `selfReviewer` / `patrol` / `finalReviewer` / `leadPatrol`），未配置时自动读运行时环境（如 T3 `pstack-t3.json`）或探测可用模型。
   - `selfReview`: 个人默认是否自审（协作者默认开、主研发默认关）；开发与自审优先跨厂商模型。
+  - `rules`: 可选的三层大白话协作规矩数组，如 `["提交前先在台账记准备做", "有疑问先问再动手"]`；只收协作与风控规矩，编码/格式规范请放仓库 `AGENTS.md`。`projects/<group-slug>.yaml` 与本次 `--overrides` 同样可写 `rules`，按 **个人 → 工程 → 临时** 合并为生效清单；每层 ≤5 条、单条建议 ≤80 字、三层合计 ≤10 条只提醒不截断，L3 下个人规矩不得绕过公共门禁（免终审、调低风险判定、绕过升级串、私合环境/主干分支会被拦下并记入 `rules.blocked`）。
 - `projects/<group-slug>.yaml`：
   - `forge`: `gitlab` 或 `github`（私有 GitLab 实例可显式指定 `hostname: gitlab.example.com`）
   - `hubRepo`: 核心仓（`id` 或 `owner/repo`、本地路径、默认主干分支 `main/master`、提交前缀正则）
@@ -70,7 +71,7 @@
    - 若用户只说了一句话且关键边界清晰 → 直接给简版五项（L1）或拆 1–3 个步骤；
    - 若需求存在阻断歧义 → 先列 2–4 个具体问题快速澄清（P0），不瞎猜。
 3. **一次合并确认单（固定确认点）**：
-   - 调用 `node <skill>/scripts/loopctl.mjs preview-init --req <slug> --project <slug> [--tier L1|L2|L3] [--repos a,b] [--branch <br>] [--stage P0|P1|P2|P3]` 输出极简确认单，确认对象与后续 `init` 完全共用同一规范（核心仓身份固定、拒绝未知仓名），等用户回复「确认」。
+   - 调用 `node <skill>/scripts/loopctl.mjs preview-init --req <slug> --project <slug> [--tier L1|L2|L3] [--repos a,b] [--branch <br>] [--stage P0|P1|P2|P3]` 输出极简确认单，确认对象与后续 `init` 完全共用同一规范（核心仓身份固定、拒绝未知仓名），等用户回复「确认」；配置了生效协作规矩时，6 行之后多一行 `协作规矩：生效 N 条（个人 x / 工程 y / 临时 z）`，未配置 `rules` 时确认单与旧版一致。
 4. **一键搭脚手架并进首轮**：
    - 调用 `forge.mjs labels-sync --forge ... --repos ... --labels ...` 同步勾选子仓的实际档位标签集（兼容 GitHub 无 Group 级标签，默认只补缺不覆盖已有共享标签颜色）；
    - 按档位用 `forge.mjs issue-create` 在 `hubRepo` 创建台账 Issue（L1 建 1 个；L2 建主台账；L3 初始化建 3 个：总台账 + 主研发小台账 + 升级 Issue，其余协作者加入时建各自小台账）；

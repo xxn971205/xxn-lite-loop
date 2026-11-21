@@ -25,6 +25,7 @@ import { spawnSync } from 'node:child_process';
 import {
   TRACKING_SECTIONS,
   PERSONAL_SECTIONS,
+  RULES_WARNING_PREFIX,
   countLedgerLines,
   ledgerSection,
   labelNames,
@@ -709,6 +710,103 @@ function resolveGitBaselineStartSha(repoPath, baselineBranch, trunkBranch) {
   return null;
 }
 
+/* ------------------------------------------------------------------ */
+/* 三层协作规矩（rules）：清洗、轻护栏提醒与 L3 公共门禁安全阀                 */
+/* ------------------------------------------------------------------ */
+
+const RULES_MAX_PER_LAYER = 5;
+const RULES_MAX_LENGTH = 80;
+const RULES_MAX_TOTAL = 10;
+
+/** 明显属于编码/格式规范的词：命中只提醒挪到仓库 AGENTS.md，不阻断、不改写。 */
+const RULE_STYLE_HINTS = [
+  /驼峰/, /下划线命名|命名用下划线|下划线分隔/, /缩进/, /分号/,
+  /注释语言|注释风格|注释规范/, /eslint/i, /checkstyle/i, /stylelint/i, /prettier/i, /golangci-lint/i,
+  /单测覆盖率|单元测试覆盖率|测试覆盖率/, /代码风格|代码规范|编码规范|代码格式/,
+];
+
+/** 单层清洗：允许误传单条字符串；trim + 去空串 + 去重；空或未填零警告。 */
+function cleanRuleLayer(value, label, warnings) {
+  if (value === undefined || value === null) return [];
+  let items;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return [];
+    warnings.push(`${RULES_WARNING_PREFIX}「${label}」里的 rules 写成了单条字符串，已按一条规矩处理；建议改成列表 rules: ["……"]。`);
+    items = [text];
+  } else if (Array.isArray(value)) {
+    items = value;
+  } else {
+    throw new CliError('INVALID_RULES', `「${label}」的 rules 必须是字符串数组（一条大白话规矩一项），收到：${typeof value}`);
+  }
+  const out = [];
+  items.forEach((item, index) => {
+    if (item === null || item === undefined) return;
+    if (typeof item !== 'string') {
+      throw new CliError('INVALID_RULES', `「${label}」的 rules 第 ${index + 1} 项不是字符串，收到：${typeof item}`);
+    }
+    const text = item.trim();
+    if (text && !out.includes(text)) out.push(text);
+  });
+  return out;
+}
+
+/**
+ * 三条轻护栏，只给 warnings 绝不静默截断：
+ *   (a) 每层 ≤5 条、单条 ≤80 字、三层合计 ≤10 条；
+ *   (b) 命中编码/格式规范词时提醒挪到仓库 AGENTS.md；
+ *   (c) L3 个人规矩不得绕过公共门禁：命中的记入 blocked 并移出生效规则。
+ */
+function reviewRules({ personal, project, temp, tier, warnings }) {
+  for (const [label, rules] of [['me.yaml', personal], ['工程组档案', project], ['本次覆盖', temp]]) {
+    if (rules.length > RULES_MAX_PER_LAYER) {
+      warnings.push(`${RULES_WARNING_PREFIX}「${label}」配了 ${rules.length} 条，超过每层 ${RULES_MAX_PER_LAYER} 条上限；请精简或合并（一条都没截断）。`);
+    }
+    rules.forEach((rule, index) => {
+      if (rule.length > RULES_MAX_LENGTH) {
+        warnings.push(`${RULES_WARNING_PREFIX}「${label}」第 ${index + 1} 条有 ${rule.length} 字，超过单条 ${RULES_MAX_LENGTH} 字建议；请压缩成一句话（一条都没截断）。`);
+      }
+      if (RULE_STYLE_HINTS.some((pattern) => pattern.test(rule))) {
+        warnings.push(`${RULES_WARNING_PREFIX}「${label}」第 ${index + 1} 条「${rule}」像编码/格式规范；编码规范建议放到仓库 AGENTS.md，Loop rules 只收协作与风控规矩。`);
+      }
+    });
+  }
+
+  const blocked = [];
+  const personalEffective = [];
+  for (const rule of personal) {
+    if (tier !== 'L3') {
+      personalEffective.push(rule);
+      continue;
+    }
+    const probe = checkPersonalPolicyOverride(rule);
+    if (probe.ok === false && probe.violations.length > 0) {
+      const codes = probe.violations.map((item) => item.code).join(',');
+      blocked.push({ layer: 'personal', rule, code: probe.violations[0].code, message: probe.violations[0].message });
+      warnings.push(`${RULES_WARNING_PREFIX}L3 个人规矩「${rule}」试图绕过公共门禁（${codes}）：已拦下不生效，请改成加严或撤销。`);
+      continue;
+    }
+    personalEffective.push(rule);
+  }
+
+  const effective = [...personalEffective, ...project, ...temp];
+  if (effective.length > RULES_MAX_TOTAL) {
+    warnings.push(`${RULES_WARNING_PREFIX}三层合计生效 ${effective.length} 条，超过 ${RULES_MAX_TOTAL} 条上限；请瘦身到 ${RULES_MAX_TOTAL} 条以内（一条都没截断）。`);
+  }
+  return { personal, project, temp, effective, blocked };
+}
+
+/** 三层各自取 rules：个人（me.yaml）→ 工程（projects/<slug>）→ 临时（overrides）。 */
+function collectRules({ me, proj, over, tier, warnings }) {
+  return reviewRules({
+    personal: cleanRuleLayer(me?.rules, 'me.yaml', warnings),
+    project: cleanRuleLayer(proj?.rules, '工程组档案', warnings),
+    temp: cleanRuleLayer(over?.rules, '本次覆盖', warnings),
+    tier,
+    warnings,
+  });
+}
+
 function resolveConfig({ configDir, project, tier, overrides }) {
   const meFile = findConfigFile(configDir, 'me');
   const projectFile = project ? findConfigFile(path.join(configDir, 'projects'), project) : null;
@@ -747,6 +845,7 @@ function resolveConfig({ configDir, project, tier, overrides }) {
   hm(notify.dailyReportTime);
   const warnings = [];
   if (project && !projectFile) warnings.push(`工程组档案不存在：projects/${project}.yaml|yml|json（按首次工程处理）`);
+  const rules = collectRules({ me, proj, over, tier: chosen, warnings });
 
   return {
     configDir,
@@ -781,6 +880,7 @@ function resolveConfig({ configDir, project, tier, overrides }) {
     autoMergeConfigured: layers.some((l) => l.autoMerge !== undefined),
     contracts: profile.contracts,
     user: String(m.user ?? m.name ?? 'me'),
+    rules,
     warnings,
   };
 }
@@ -845,6 +945,7 @@ function buildRunSpec(flags, configDir) {
     roleModels: cfg.roleModels,
     selfReview: cfg.selfReview,
     contracts: cfg.contracts,
+    rules: cfg.rules,
     issues: normalizeIssueMap(parseJsonArg(flags['issue-map'], 'issue-map')),
   };
   const warnings = [...cfg.warnings];
@@ -1051,6 +1152,15 @@ function timerSummary(run) {
   return `${base}+调度${t.controllerLoopMinutes}m+大巡检${t.leadPatrolMinutes}m${run.notify.dailyReportEnabled ? `+日报${run.notify.dailyReportTime}` : ''}`;
 }
 
+/** 有生效协作规矩时才追加的 1 行摘要；未配置 rules 时确认单保持原样 6 行。 */
+function ruleSummaryLine(rules) {
+  const effective = Array.isArray(rules?.effective) ? rules.effective : [];
+  if (effective.length === 0) return null;
+  const blockedPersonal = (Array.isArray(rules?.blocked) ? rules.blocked : []).filter((item) => item?.layer === 'personal').length;
+  const personal = Math.max((rules?.personal?.length ?? 0) - blockedPersonal, 0);
+  return `协作规矩：生效 ${effective.length} 条（个人 ${personal} / 工程 ${rules?.project?.length ?? 0} / 临时 ${rules?.temp?.length ?? 0}）`;
+}
+
 function confirmLines(run) {
   const models = run.roleModels ?? {};
   const model = (key) => models[key] ?? '未配置';
@@ -1061,7 +1171,7 @@ function confirmLines(run) {
   let merge = '全部人工合并';
   if (matchesBranchPattern(run.baselineBranch, run.protectedEnvBranches)) merge = '全人工合并（基线命中受保护环境分支，硬禁自动合并）';
   else if (run.autoMerge) merge = `低风险自动合并（${run.protectedEnvBranches.join('/')} 一律人工）`;
-  return [
+  const lines = [
     `1. 需求与档位：${run.req} ｜ 档位：${run.tier} ｜ 起跳阶段：${run.stage}`,
     `2. 工程组与基线：Forge=${run.forge ?? '未配置'}${run.gitlabHost ? `@${run.gitlabHost}` : ''} ｜ 核心仓=${run.hubRepo?.repo ?? '未配置'} ｜ 关联仓=${linked.length ? linked.join(',') : '无'} ｜ 基线=${run.branch}`,
     `3. 验证策略：mode=${run.verification?.mode ?? 'local-test'} ｜ 命令=${commands}`,
@@ -1069,6 +1179,9 @@ function confirmLines(run) {
     `5. 节奏与确认点：定时=${timerSummary(run)} ｜ 工作时段=${run.workHours.start}-${run.workHours.end}（${run.workHours.timezone}） ｜ 合并=${merge} ｜ 通知=${notify}`,
     '6. 收尾约定：业务仓库零规范残留；合入后执行 teardown 两步拆架（先出清单保留运行态，逐项回执后才归档）。',
   ];
+  const summary = ruleSummaryLine(run.rules);
+  if (summary) lines.push(summary);
+  return lines;
 }
 
 function planFor(run) {
@@ -1228,6 +1341,7 @@ function planUpgrade(run, to, slots, cfg) {
     autoMerge: run.autoMergeConfigured ? run.autoMerge : TIER_PROFILES[to].autoMerge,
     contracts: TIER_PROFILES[to].contracts,
     contractVersion: run.contractVersion ?? 'v1',
+    rules: cfg.rules,
   };
   next.ledgers = buildLedgers(next);
   next.scheduledTasks = scheduledTasksFor(next);
@@ -1780,6 +1894,30 @@ function evalSmallPatrol(input, t, ctx) {
   return out;
 }
 
+/** 结构化个人规矩（personalRules）也走第 5 探针的同一套客观越界检测。 */
+function personalRuleFindings(rules, { slot, ref, source, recipients }) {
+  const out = [];
+  const seen = new Set();
+  for (const rule of Array.isArray(rules) ? rules : []) {
+    if (typeof rule !== 'string' || !rule.trim()) continue;
+    const probe = checkPersonalPolicyOverride(rule.trim());
+    if (probe.ok !== false || !Array.isArray(probe.violations) || probe.violations.length === 0) continue;
+    const codes = probe.violations.map((item) => item.code).join(',');
+    const key = `PERSONAL_POLICY_VIOLATION:${ref}:rules:${codes}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(finding(
+      'PERSONAL_POLICY_VIOLATION',
+      'alert',
+      key,
+      '个人临时约定试图绕过 L3 公共门禁',
+      `槽位 ${slot} 个人规矩「${rule.trim()}」触发公共红线（${probe.violations.map((item) => item.reason ?? item.message ?? item.code).join('；')}）：该规矩无效，请立即撤销。`,
+      { slot, source, violations: probe.violations, personalRule: rule.trim(), recipients },
+    ));
+  }
+  return out;
+}
+
 function evalLeadPatrol(input, t, ctx) {
   const out = [];
   const lead = { person: input.lead?.person ?? '主研发', openId: input.lead?.openId ?? input.leadOpenId ?? null };
@@ -1849,7 +1987,13 @@ function evalLeadPatrol(input, t, ctx) {
         ));
       }
     }
+    out.push(...personalRuleFindings(ledger.personalRules, {
+      slot, ref: ledgerRef, source: 'ledger', recipients: [who(ledger), lead],
+    }));
   }
+  out.push(...personalRuleFindings(input.personalRules, {
+    slot: input.slot ?? '主研发', ref: 'personalRules', source: 'input', recipients: [lead],
+  }));
   for (const doc of input.externalDocs ?? []) {
     if (doc?.landedInItems !== false) continue;
     out.push(finding('EXTERNAL_DOC_GAP', 'alert', `EXTERNAL_DOC_GAP:${doc.url}`, '外部设计文档未落五项',

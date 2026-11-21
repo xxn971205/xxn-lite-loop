@@ -23,6 +23,8 @@
 | 收到【基线变更】或基线更新 | `forge.mjs baseline-check` | 先 fetch 涉及子仓核对最新远端 SHA（fetch 失败必须停下不得假报对齐），复核受影响设计与分支再继续 |
 | 收尾拆架 | `lifecycle.md`（第五节「收尾拆架」） | 两步法运行 `loopctl.mjs teardown` 预检 → 外部清理 → `--finalize` 核验归档 |
 
+**三层协作规矩**：`me.yaml`、工程档案与本次覆盖里的 `rules` 已由 `loopctl.mjs config-resolve` 合并成生效清单，确认单只给一行摘要。主控派活与自查按生效清单执行；命中「编码规范」提醒的条目不进 Loop 执行，只提示本人挪到仓库 `AGENTS.md`；L3 下被拦下的个人规矩（`rules.blocked`）不得当作生效约定执行。
+
 ## 二、唤醒判定表（由 `loopctl.mjs wake-decision` 同口径校验）
 
 适用定时唤醒（参数见 `tiers.md`）。「有依据」指存在交给自己的【交接】，或在工作时段由巡检判定失联/卡住的【提醒】评论。

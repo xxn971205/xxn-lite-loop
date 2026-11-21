@@ -7,10 +7,13 @@
  *   2. 幂等：重复执行结果一致；--uninstall 只摘自己的条目。
  *   3. 非破坏：目标文件不是合法 JSON 时直接报错，不写坏原文件；改动前留一份 .bak。
  *   4. 可预演：--dry-run 只报告将要发生的改动，不落盘。
+ *   5. 参数严格：只认下列已知参数；未知参数（如 --status）立即退出码 1 返回结构化错误 + usage，
+ *      绝不静默当成 install 执行，也不改写任何文件。
  *
  * 用法：
  *   node hooks/install-hooks.mjs [--target claude|codex|antigravity|all] [--scope user|project]
- *                                [--file <settings.json>] [--cwd <dir>] [--dry-run] [--uninstall]
+ *                                [--file <settings.json>] [--cwd <dir>] [--config-dir <dir>]
+ *                                [--dry-run] [--uninstall] [--help|-h]
  *
  * 默认目标：自动探测已安装的 Agent，探测不到时用 claude。
  * 默认作用域：user。
@@ -55,27 +58,57 @@ const TARGETS = {
 };
 
 class CliError extends Error {
-  constructor(code, message, extra = {}) {
+  constructor(code, message, extra = {}, exitCode = 2) {
     super(message);
     this.code = code;
     this.extra = extra;
+    this.exitCode = exitCode;
   }
+}
+
+const USAGE = [
+  'node hooks/install-hooks.mjs [--target claude|codex|antigravity|all] [--scope user|project] [--dry-run] [--uninstall]',
+  'node hooks/install-hooks.mjs --target claude --file <settings.json> --dry-run',
+];
+
+const VALUE_FLAGS = ['target', 'scope', 'file', 'cwd', 'config-dir'];
+const BOOLEAN_FLAGS = ['dry-run', 'uninstall', 'help'];
+const KNOWN_FLAGS = new Set([...VALUE_FLAGS, ...BOOLEAN_FLAGS]);
+
+function unknownArg(token) {
+  return new CliError(
+    'UNKNOWN_ARG',
+    `未知参数：${token}；install-hooks 只认 ${[...KNOWN_FLAGS].map((key) => `--${key}`).join(' / ')} 与 -h，绝不把未知参数当成 install 执行`,
+    { usage: USAGE, knownFlags: [...KNOWN_FLAGS], arg: token },
+    1,
+  );
 }
 
 function parseArgs(argv) {
   const flags = Object.create(null);
   for (let i = 0; i < argv.length; i += 1) {
-    const token = argv[i];
-    if (!token.startsWith('--')) continue;
-    const eq = token.indexOf('=');
-    if (eq > -1) {
-      flags[token.slice(2, eq)] = token.slice(eq + 1);
+    const token = String(argv[i]);
+    if (token === '-h') {
+      flags.help = true;
       continue;
     }
-    const key = token.slice(2);
+    if (!token.startsWith('--')) throw unknownArg(token);
+    const eq = token.indexOf('=');
+    const key = eq > -1 ? token.slice(2, eq) : token.slice(2);
+    if (!KNOWN_FLAGS.has(key)) throw unknownArg(token);
+    if (eq > -1) {
+      flags[key] = token.slice(eq + 1);
+      continue;
+    }
     const next = argv[i + 1];
-    if (next !== undefined && !next.startsWith('--')) {
-      flags[key] = next;
+    if (VALUE_FLAGS.includes(key)) {
+      if (next === undefined || String(next).startsWith('-')) {
+        throw new CliError('MISSING_VALUE', `--${key} 缺少取值`, { usage: USAGE, arg: token }, 1);
+      }
+      flags[key] = String(next);
+      i += 1;
+    } else if (next !== undefined && /^(true|false)$/i.test(String(next))) {
+      flags[key] = String(next);
       i += 1;
     } else {
       flags[key] = true;
@@ -255,10 +288,7 @@ function main(argv) {
       ok: true,
       name: 'xxn-lite-loop/install-hooks.mjs',
       version: VERSION,
-      usage: [
-        'node hooks/install-hooks.mjs [--target claude|codex|antigravity|all] [--scope user|project] [--dry-run] [--uninstall]',
-        'node hooks/install-hooks.mjs --target claude --file <settings.json> --dry-run',
-      ],
+      usage: USAGE,
       targets: Object.fromEntries(Object.entries(TARGETS).map(([name, t]) => [name, { label: t.label, user: t.user(), project: t.project(process.cwd()) }])),
       sentinel: SENTINEL,
     };
@@ -293,5 +323,5 @@ try {
   process.exitCode = 0;
 } catch (err) {
   process.stdout.write(`${JSON.stringify({ ok: false, code: err.code ?? 'UNEXPECTED_ERROR', message: err.message, ...(err.extra ?? {}) }, null, 2)}\n`);
-  process.exitCode = 2;
+  process.exitCode = err.exitCode ?? 2;
 }

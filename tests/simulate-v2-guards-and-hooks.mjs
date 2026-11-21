@@ -947,7 +947,205 @@ try {
     assertAntigravity(execute('/bin/sh', ['-c', command], { cwd: OUTSIDE, input: JSON.stringify(payload) }), 'deny');
   });
 
-  group('6. public distribution checks');
+  group('6. hook installer argument validation');
+  const argScope = path.join(TMP, 'hook-args');
+  const argFile = path.join(argScope, 'settings.json');
+  writeJson(argFile, initial);
+  const argScopeBefore = snapshotTree(argScope);
+  const homeBefore = snapshotTree(HOME_DIR);
+  check('unknown flag --status exits 1 with a structured error and usage', () => {
+    const result = cli(INSTALL, ['--target', 'claude', '--file', argFile, '--status']);
+    requireExit(result, 1);
+    const data = requireJson(result);
+    assert.equal(data.ok, false, describe(result));
+    assert.equal(data.code, 'UNKNOWN_ARG', describe(result));
+    assert.match(data.message, /未知参数：--status/);
+    assert.ok(Array.isArray(data.usage) && data.usage.length > 0, JSON.stringify(data));
+    assert.ok(data.usage.some((line) => line.includes('install-hooks.mjs')), JSON.stringify(data.usage));
+  });
+  check('unknown flag never rewrites the target file or leaves a backup', () => {
+    assert.deepEqual(snapshotTree(argScope), argScopeBefore);
+  });
+  check('unknown flag alone exits 1 without touching user-scope settings', () => {
+    const result = cli(INSTALL, ['--status']);
+    requireExit(result, 1);
+    assert.equal(requireJson(result).code, 'UNKNOWN_ARG', describe(result));
+  });
+  check('unknown flag leaves every user-scope settings file byte-identical', () => {
+    assert.deepEqual(snapshotTree(HOME_DIR), homeBefore);
+  });
+  for (const flag of ['--help', '-h']) check(`${flag} still prints usage and exits 0`, () => {
+    const result = cli(INSTALL, [flag]);
+    requireExit(result);
+    const data = requireJson(result);
+    assert.equal(data.ok, true, describe(result));
+    assert.ok(data.usage.some((line) => line.includes('--uninstall')), JSON.stringify(data));
+  });
+
+  group('7. three-layer collaboration rules');
+  const rulesConfig = path.join(TMP, 'rules-config');
+  const rulesProject = {
+    forge: 'github',
+    hubRepo: { name: 'demo', repo: 'example/demo', path: ACTIVE, branch: 'feature_demo' },
+    verification: { commands: {} },
+  };
+  function resolveRules(config, extra = []) {
+    const result = loop(['config-resolve', '--project', 'demo', ...extra], config);
+    requireExit(result);
+    return requireJson(result);
+  }
+  writeJson(path.join(rulesConfig, 'me.json'), {
+    user: 'fixture-user', rules: [' 提交前先对账 ', '提交前先对账', '有疑问先问再动手', '   '],
+  });
+  writeJson(path.join(rulesConfig, 'projects', 'demo.json'), { ...rulesProject, rules: ['跨仓改动先发升级串'] });
+  check('three layers merge in personal, project, temp order after trim and dedupe', () => {
+    const data = resolveRules(rulesConfig, ['--overrides', JSON.stringify({ rules: ['临时：今天只做只读对账'] })]);
+    assert.deepEqual(data.rules.personal, ['提交前先对账', '有疑问先问再动手']);
+    assert.deepEqual(data.rules.project, ['跨仓改动先发升级串']);
+    assert.deepEqual(data.rules.temp, ['临时：今天只做只读对账']);
+    assert.deepEqual(data.rules.effective, ['提交前先对账', '有疑问先问再动手', '跨仓改动先发升级串', '临时：今天只做只读对账']);
+    assert.deepEqual(data.rules.blocked, []);
+    assert.deepEqual(data.warnings, []);
+  });
+  const emptyRulesConfig = path.join(TMP, 'rules-empty');
+  writeJson(path.join(emptyRulesConfig, 'me.json'), { user: 'fixture-user' });
+  writeJson(path.join(emptyRulesConfig, 'projects', 'demo.json'), rulesProject);
+  check('unconfigured rules stay empty arrays with zero warnings', () => {
+    const data = resolveRules(emptyRulesConfig);
+    assert.deepEqual(data.rules, { personal: [], project: [], temp: [], effective: [], blocked: [] });
+    assert.deepEqual(data.warnings, []);
+  });
+  check('a single string rule becomes one item with a reminder', () => {
+    const data = resolveRules(rulesConfig, ['--overrides', JSON.stringify({ rules: '单条规矩也要收' })]);
+    assert.deepEqual(data.rules.temp, ['单条规矩也要收']);
+    assert.equal(data.warnings.filter((item) => /单条字符串/.test(item)).length, 1, JSON.stringify(data.warnings));
+  });
+  const crowdedConfig = path.join(TMP, 'rules-crowded');
+  const longRule = '这一条故意写得很长'.repeat(9);
+  const sixShort = ['规矩一', '规矩二', '规矩三', '规矩四', '规矩五', '规矩六'];
+  writeJson(path.join(crowdedConfig, 'me.json'), { user: 'fixture-user', rules: [...sixShort, longRule] });
+  writeJson(path.join(crowdedConfig, 'projects', 'demo.json'), {
+    ...rulesProject, rules: ['工程一', '工程二', '工程三', '工程四', '工程五', '工程六'],
+  });
+  check('per-layer cap, 80-character hint and total cap warn without truncating', () => {
+    const data = resolveRules(crowdedConfig);
+    const text = data.warnings.join('\n');
+    assert.match(text, /「me\.yaml」配了 7 条，超过每层 5 条上限/);
+    assert.match(text, /「工程组档案」配了 6 条，超过每层 5 条上限/);
+    assert.match(text, new RegExp(`有 ${longRule.length} 字，超过单条 80 字建议`));
+    assert.match(text, /三层合计生效 13 条，超过 10 条上限/);
+    assert.equal(data.rules.personal.length, 7, JSON.stringify(data.rules.personal));
+    assert.equal(data.rules.project.length, 6);
+    assert.equal(data.rules.effective.length, 13);
+    for (const rule of [...sixShort, longRule, '工程一', '工程六']) assert.ok(data.rules.effective.includes(rule), rule);
+  });
+  check('coding-style words get a scope reminder instead of being dropped', () => {
+    const data = resolveRules(rulesConfig, ['--overrides', JSON.stringify({ rules: ['变量一律用驼峰命名', '提交前跑一遍 ESLint'] })]);
+    const hits = data.warnings.filter((item) => /AGENTS\.md/.test(item));
+    assert.equal(hits.length, 2, JSON.stringify(data.warnings));
+    assert.match(hits[0], /编码规范建议放到仓库 AGENTS\.md，Loop rules 只收协作与风控规矩/);
+    assert.deepEqual(data.rules.temp, ['变量一律用驼峰命名', '提交前跑一遍 ESLint']);
+  });
+  const gateConfig = path.join(TMP, 'rules-gate');
+  writeJson(path.join(gateConfig, 'me.json'), {
+    user: 'fixture-user',
+    rules: ['免终审直接合', '调低风险判定', '提交前本人先看', '不得跳过终审，契约变更必须走升级串'],
+  });
+  writeJson(path.join(gateConfig, 'projects', 'demo.json'), rulesProject);
+  check('L3 personal rules that bypass public gates are blocked and leave effective', () => {
+    const data = resolveRules(gateConfig, ['--tier', 'L3']);
+    assert.deepEqual(data.rules.blocked.map((item) => item.rule), ['免终审直接合', '调低风险判定']);
+    assert.deepEqual(data.rules.blocked.map((item) => item.code), ['BYPASS_FINAL_REVIEW', 'DOWNGRADE_RISK']);
+    assert.equal(data.rules.personal.length, 4, JSON.stringify(data.rules.personal));
+    assert.deepEqual(data.rules.effective, ['提交前本人先看', '不得跳过终审，契约变更必须走升级串']);
+    const text = data.warnings.join('\n');
+    assert.match(text, /L3 个人规矩「免终审直接合」试图绕过公共门禁/);
+    assert.match(text, /已拦下不生效/);
+  });
+  check('stricter personal rules still pass the L3 gate', () => {
+    const data = resolveRules(gateConfig, ['--tier', 'L3']);
+    assert.ok(data.rules.effective.includes('不得跳过终审，契约变更必须走升级串'));
+    assert.ok(data.rules.effective.includes('提交前本人先看'));
+  });
+  check('the same personal rules are not blocked below L3', () => {
+    const data = resolveRules(gateConfig, ['--tier', 'L2']);
+    assert.deepEqual(data.rules.blocked, []);
+    assert.equal(data.rules.effective.length, 4);
+    assert.ok(!data.warnings.some((item) => /绕过公共门禁/.test(item)), JSON.stringify(data.warnings));
+  });
+  check('confirm sheet appends one compact rules line only when rules are effective', () => {
+    const withRules = loop(['preview-init', '--req', 'rules-preview', '--project', 'demo', '--tier', 'L2',
+      '--branch', 'loop/rules', '--overrides', JSON.stringify({ rules: ['临时：今天只做只读对账'] })], rulesConfig);
+    requireExit(withRules);
+    const sheet = requireJson(withRules).confirmSheet;
+    assert.equal(sheet.length, 7, JSON.stringify(sheet));
+    assert.equal(sheet[6], '协作规矩：生效 4 条（个人 2 / 工程 1 / 临时 1）');
+    const without = loop(['preview-init', '--req', 'rules-preview', '--project', 'demo', '--tier', 'L2', '--branch', 'loop/rules'], emptyRulesConfig);
+    requireExit(without);
+    assert.equal(requireJson(without).confirmSheet.length, 6);
+  });
+  check('init persists rules through buildRunSpec', () => {
+    const result = loop(['init', '--req', 'rules-run', '--project', 'demo', '--tier', 'L2',
+      '--branch', 'feature_demo', '--session', 'rules-owner'], rulesConfig);
+    requireExit(result);
+    const data = requireJson(result);
+    assert.deepEqual(data.run.rules.effective, ['提交前先对账', '有疑问先问再动手', '跨仓改动先发升级串']);
+    assert.equal(data.confirmSheet.length, 7, JSON.stringify(data.confirmSheet));
+  });
+  check('L2 to L3 upgrade re-applies the public gate to persisted rules', () => {
+    const created = loop(['init', '--req', 'gate-run', '--project', 'demo', '--tier', 'L2',
+      '--branch', 'feature_demo', '--session', 'gate-owner'], gateConfig);
+    requireExit(created);
+    assert.equal(requireJson(created).run.rules.effective.length, 4, describe(created));
+    const upgraded = loop(['upgrade', '--req', 'gate-run', '--to', 'L3'], gateConfig);
+    requireExit(upgraded);
+    const data = requireJson(upgraded);
+    assert.equal(data.phase, 'planned', describe(upgraded));
+    assert.deepEqual(data.nextRun.rules.blocked.map((item) => item.rule), ['免终审直接合', '调低风险判定']);
+    assert.deepEqual(data.nextRun.rules.effective, ['提交前本人先看', '不得跳过终审，契约变更必须走升级串']);
+  });
+  check('doctor surfaces rules guardrail warnings on the config check', () => {
+    const data = doctor(crowdedConfig, ['--project', 'demo']);
+    const item = doctorCheck(data, 'config');
+    assert.equal(item.status, 'WARN', JSON.stringify(data));
+    assert.match(item.detail, /协作规矩：/);
+    assert.match(item.fix, /每层 ≤5 条/);
+    assert.equal(data.ok, true, JSON.stringify(data));
+  });
+  check('doctor keeps config PASS when rules are clean', () => {
+    const data = doctor(rulesConfig, ['--project', 'demo']);
+    const item = doctorCheck(data, 'config');
+    assert.equal(item.status, 'PASS', JSON.stringify(data));
+    assert.doesNotMatch(item.detail, /协作规矩/);
+  });
+  check('doctor surfaces blocked L3 personal rules', () => {
+    const l3Config = path.join(TMP, 'rules-gate-l3');
+    writeJson(path.join(l3Config, 'me.json'), { user: 'fixture-user', defaultTier: 'L3', rules: ['免终审直接合', '提交前本人先看'] });
+    writeJson(path.join(l3Config, 'projects', 'demo.json'), rulesProject);
+    const data = doctor(l3Config, ['--project', 'demo']);
+    const item = doctorCheck(data, 'config');
+    assert.equal(item.status, 'WARN', JSON.stringify(data));
+    assert.match(item.detail, /L3 个人规矩已拦下 1 条/);
+    assert.equal(data.ok, true, JSON.stringify(data));
+  });
+  function rulePatrolFindings(input) {
+    const result = loop(['eval-patrol', '--input', JSON.stringify({ mode: 'lead', tier: 'L3', ...input })]);
+    requireExit(result);
+    return requireJson(result).findings.filter((finding) => finding.code === 'PERSONAL_POLICY_VIOLATION');
+  }
+  check('lead patrol probes personalRules from the ledger and the input', () => {
+    const fromLedger = rulePatrolFindings({ ledgers: [{ id: 7, slot: 'A', personalRules: ['绕过升级串直接改契约'] }] });
+    assert.equal(fromLedger.length, 1, JSON.stringify(fromLedger));
+    assert.match(fromLedger[0].detail, /槽位 A 个人规矩「绕过升级串直接改契约」/);
+    assert.match(fromLedger[0].key, /rules:BYPASS_CONTRACT_OR_HOTFILE$/);
+    const fromInput = rulePatrolFindings({ personalRules: ['免终审直接合'], ledgers: [{ id: 7, slot: 'A' }] });
+    assert.equal(fromInput.length, 1, JSON.stringify(fromInput));
+    assert.match(fromInput[0].detail, /槽位 主研发 个人规矩「免终审直接合」/);
+    const strict = rulePatrolFindings({ personalRules: ['提交前本人先看', '不得跳过终审'], ledgers: [{ id: 7, slot: 'A' }] });
+    assert.deepEqual(strict, []);
+  });
+
+  group('8. public distribution checks');
   const distribution = path.join(TMP, '分发 root with spaces');
   const sync = path.join(distribution, 'scripts', 'sync-mirrors.mjs');
   const archive = path.join(TMP, 'starter.zip');

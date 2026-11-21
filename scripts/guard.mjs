@@ -42,6 +42,9 @@ const LEDGER_LAYOUT = {
 const TIERS = ['L1', 'L2', 'L3'];
 const REJECT_FUSE = 2;
 
+/** 三层协作规矩（rules）提醒的统一前缀：loopctl 产出，doctor 据此在 config 检查里透出。 */
+const RULES_WARNING_PREFIX = '协作规矩：';
+
 class CliError extends Error {
   constructor(code, message, extra = {}) {
     super(message);
@@ -326,9 +329,22 @@ function runDoctor(flags = {}, configDir, opts = {}) {
     else if (slugs.length > 0) parts.push(`未指定 --project（检测到 ${slugs.length} 个工程档案）`);
     else parts.push('工程档案缺失');
     const ready = Boolean(meFile) && Boolean(projectFile);
-    checks.push(ready
-      ? check('config', 'PASS', parts.join(' ｜ '))
-      : check('config', 'WARN', parts.join(' ｜ '), '按 4 题冷启动向导一次生成 me.yaml 与工程档案（绝不让用户手写 YAML）；多工程时传 --project <slug>'));
+    // 三层协作规矩的轻护栏提醒与 L3 越界拦截：只把提醒搬到 config 检查里，绝不把基础运行判死。
+    const rulesWarnings = (Array.isArray(cfg?.warnings) ? cfg.warnings : [])
+      .filter((item) => String(item).startsWith(RULES_WARNING_PREFIX));
+    const rulesBlocked = Array.isArray(cfg?.rules?.blocked) ? cfg.rules.blocked.length : 0;
+    const detail = [
+      ...parts,
+      ...(rulesBlocked ? [`${RULES_WARNING_PREFIX}L3 个人规矩已拦下 ${rulesBlocked} 条（不生效）`] : []),
+      ...rulesWarnings,
+    ].join(' ｜ ');
+    if (ready && (rulesWarnings.length > 0 || rulesBlocked > 0)) {
+      checks.push(check('config', 'WARN', detail, '按提醒精简 rules（每层 ≤5 条、单条 ≤80 字、三层合计 ≤10 条，只收协作与风控规矩）；L3 个人规矩不得绕过公共门禁'));
+    } else if (ready) {
+      checks.push(check('config', 'PASS', detail));
+    } else {
+      checks.push(check('config', 'WARN', detail, '按 4 题冷启动向导一次生成 me.yaml 与工程档案（绝不让用户手写 YAML）；多工程时传 --project <slug>'));
+    }
   }
 
   // ⑤ 首个校验命令：只看配置里第一条命令的可执行性，缺失只 WARN（验证时才发现也来得及）。
@@ -629,7 +645,7 @@ const POLICY_RULES = [
   {
     code: 'DOWNGRADE_RISK',
     message: '个人约定试图降级风险判定或强制风险低（公共硬底线：6 条规则命中即高风险，未核验不得判低）',
-    verbs: /(降(低|级|档)|放宽|降格|按低风险|视为低风险|当作低风险|强制低|一律低|直接判低)/,
+    verbs: /(降(低|级|档)|调低|调降|放宽|降格|按低风险|视为低风险|当作低风险|强制低|一律低|直接判低)/,
     objects: [/风险(?:等级|判定|定级|高|低)/],
   },
   {
@@ -854,6 +870,7 @@ function buildLiveStatus(base, live, run) {
 export {
   TRACKING_SECTIONS,
   PERSONAL_SECTIONS,
+  RULES_WARNING_PREFIX,
   countLedgerLines,
   ledgerSection,
   labelNames,
