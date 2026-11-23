@@ -18,12 +18,12 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LOOP = path.join(ROOT, 'scripts', 'loopctl.mjs');
 const FORGE = path.join(ROOT, 'scripts', 'forge.mjs');
-const RETRO = path.join(ROOT, 'scripts', 'retro.mjs');
 const HOOK = path.join(ROOT, 'hooks', 'guard-command.mjs');
 const INSTALL = path.join(ROOT, 'hooks', 'install-hooks.mjs');
 const SYNC = path.join(ROOT, 'scripts', 'sync-mirrors.mjs');
 const INSTALL_SH = path.join(ROOT, 'install.sh');
-const SOURCE_FILES = [LOOP, FORGE, RETRO, path.join(ROOT, 'scripts', 'guard.mjs'), HOOK, INSTALL, SYNC, INSTALL_SH];
+const SOURCE_FILES = [LOOP, FORGE, path.join(ROOT, 'scripts', 'guard.mjs'),
+  path.join(ROOT, 'scripts', 'lib', 'common.mjs'), HOOK, INSTALL, SYNC, INSTALL_SH];
 const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const initialHashes = Object.fromEntries(SOURCE_FILES.map((file) => [path.relative(ROOT, file), sha256(file)]));
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'xxn-loop-v2-accept-'));
@@ -124,14 +124,31 @@ function quoted(value) { return `'${String(value).replaceAll("'", "'\\''")}'`; }
 const FAKE_FORGE = `#!${process.execPath}
 const fs = require('node:fs');
 const args = process.argv.slice(2);
-if (args[0] === 'auth' && args[1] === 'status') { console.log('authenticated fixture'); process.exit(0); }
 const file = process.env.FAKE_FORGE_STATE;
 const log = process.env.FAKE_FORGE_LOG;
 const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+if (args[0] === 'auth' && args[1] === 'status') {
+  if (state.captureAuth) fs.appendFileSync(log, JSON.stringify({ args }) + '\\n');
+  console.log('authenticated fixture');
+  process.exit(0);
+}
 let stdin = '';
 try { stdin = fs.readFileSync(0, 'utf8'); } catch {}
 fs.appendFileSync(log, JSON.stringify({ args, stdin, parent: process.ppid }) + '\\n');
 const save = () => fs.writeFileSync(file, JSON.stringify(state));
+const endpoint = args.at(-1);
+if (args[0] === 'api' && /^(?:repos|projects)\\/.*\\/(?:branches|protected_branches)\\b/.test(endpoint)) {
+  const fallback = {
+    'repos/example/demo/branches?per_page=100': { body: [{ name: 'feature_demo' }] },
+    'repos/example/demo/branches/feature_demo/protection': { body: {} },
+  };
+  const fixture = (state.branchApi ?? fallback)[endpoint];
+  const status = fixture?.status ?? (fixture ? 200 : 404);
+  if (args.includes('--include') && !fixture?.stderrOnly) console.log('HTTP/2 ' + status + '\\r\\n');
+  if (fixture?.body) console.log(JSON.stringify(fixture.body));
+  if (status >= 400) console.error('forge: ' + (fixture?.message ?? 'fixture error') + ' (HTTP ' + status + ')');
+  process.exit(status < 400 ? 0 : 1);
+}
 if (args[0] === 'pr' && (args[1] === 'view' || args[1] === 'merge')) {
   if (args[1] === 'merge') {
     state.pr.state = 'MERGED';
@@ -141,6 +158,10 @@ if (args[0] === 'pr' && (args[1] === 'view' || args[1] === 'merge')) {
   process.exit(0);
 }
 const method = args.includes('--method') ? args[args.indexOf('--method') + 1] : null;
+if (state.mergeFacts && args[0] === 'api') {
+  console.log('[]');
+  process.exit(0);
+}
 const read = (args[0] === 'api' && method === 'GET') || (args[0] === 'issue' && args[1] === 'view');
 const update = (args[0] === 'api' && method === 'PUT') || (args[0] === 'issue' && args[1] === 'edit');
 if (read) {
@@ -152,7 +173,8 @@ if (read) {
     state.events.push('new-owner-wrote-after-read');
     save();
   }
-  console.log(JSON.stringify({ body: oldBody, description: oldBody }));
+  console.log(JSON.stringify({ body: oldBody, description: oldBody,
+    ...(state.mergeFacts ? { state: 'OPEN', labels: [], updatedAt: '2024-05-01T04:00:00Z' } : {}) }));
   process.exit(0);
 }
 if (update) {
@@ -202,7 +224,7 @@ try {
   const project = {
     forge: 'github',
     hubRepo: { name: 'demo', repo: 'example/demo', path: ACTIVE, branch: 'feature_demo' },
-    verification: { commands: {} },
+    verification: { commands: {}, skipReason: 'fixture' },
     protectedEnvBranches: ['release/*', '/^feature_\\d+_uat$/'],
   };
   writeJson(path.join(CONFIG, 'me.json'), { user: 'fixture-user' });
@@ -227,9 +249,9 @@ try {
     'git add .', 'git commit -m "fix glab mr merge and git push origin main"',
     'git rebase origin/feature_demo', 'git rebase --continue', 'git stash', 'git stash pop',
     'git cherry-pick deadbeef', 'git worktree add ../feature-wt feat/sub1',
-    'git push origin feat/sub1', 'git push -u origin feature_demo', 'git push origin --tags',
-    'git push -f origin feature_demo', 'git push --force-with-lease origin feature_demo',
-    'git push --delete origin feat/old', 'git push origin feature_demo:feature_demo',
+    'git push origin feat/sub1', 'git push -u origin feat/sub1', 'git push origin --tags',
+    'git push -f origin feat/sub1', 'git push --force-with-lease origin feat/sub1',
+    'git push --delete origin feat/old', 'git push origin feature_demo:feat/sub1',
     'git push origin refs/tags/v1.0', 'git push --dry-run origin main',
     'git merge origin/main', 'git merge origin/master', 'git merge --abort',
     'rtk git status', 'rtk bypass git log', 'echo "git push origin main"', 'rg "gh pr merge" README.md',
@@ -304,6 +326,46 @@ try {
     assert.match(data.reason, /人工|forge\.mjs|需求分支/, describe(result));
   }
   for (const command of dangerousCommands) check(command, () => assertBlocked(guard(command)));
+  check('a project custom trunk is protected from pushes', () => {
+    const result = guard('git push origin feature_demo');
+    assertBlocked(result);
+    assert.equal(requireJson(result).code, 'PUSH_PROTECTED_BRANCH');
+  });
+  check('argumentless merge checks the configured upstream', () => {
+    git(['update-ref', 'refs/remotes/origin/test', 'HEAD'], ACTIVE);
+    git(['branch', '--set-upstream-to=origin/test', 'feature_demo'], ACTIVE);
+    try {
+      for (const command of ['git merge', 'git merge --ff-only', 'git merge @{u}']) {
+        const result = guard(command);
+        assertBlocked(result);
+        assert.equal(requireJson(result).code, 'MERGE_PROTECTED_ENV');
+      }
+    } finally {
+      git(['branch', '--unset-upstream', 'feature_demo'], ACTIVE);
+      git(['update-ref', '-d', 'refs/remotes/origin/test'], ACTIVE);
+    }
+    requireExit(guard('git merge'));
+  });
+  check('legacy invalid branch rules block guarded writes and leave other commands alone', () => {
+    const file = path.join(CONFIG, 'runs', 'active.json');
+    const run = readJson(file);
+    writeJson(file, { ...run, protectedEnvBranches: [...run.protectedEnvBranches, '/test/g'] });
+    try {
+      for (const command of ['git push origin feature_demo', 'git push origin main', 'git merge origin/feature_demo', 'git merge', 'gh pr merge 9']) {
+        const result = guard(command);
+        requireExit(result, 2);
+        assert.equal(requireJson(result).code, 'INVALID_BRANCH_PATTERN', describe(result));
+        assert.match(requireJson(result).reason, /doctor/, describe(result));
+      }
+      for (const command of ['git status', 'git push --dry-run origin main', 'git push origin --tags', 'git merge --abort', 'gh pr view 9']) {
+        const result = guard(command);
+        requireExit(result);
+        assert.equal(requireJson(result).code, 'ALLOW_IN_LOOP', describe(result));
+      }
+    } finally {
+      writeJson(file, run);
+    }
+  });
   for (const command of [`cd ${quoted(ACTIVE)} && git push origin main`, `git -C ${quoted(ACTIVE)} push origin test`]) {
     check(`from outside: ${command}`, () => assertBlocked(guard(command, OUTSIDE)));
   }
@@ -453,6 +515,92 @@ try {
     assert.equal(data.ok, true, JSON.stringify(data));
     assert.ok(data.checks.every((item) => item.status === 'PASS'), JSON.stringify(data));
     assert.ok(data.supportedTiers.includes('L1'), JSON.stringify(data));
+    assert.match(doctorCheck(data, 'forge-branch-protection').detail, /feature_demo 已保护/);
+  });
+  check('doctor GitHub checks only existing exact branches, including names with slashes', () => {
+    const config = path.join(TMP, 'doctor-github-branches');
+    writeJson(path.join(config, 'me.json'), { user: 'fixture-user' });
+    writeJson(path.join(config, 'projects', 'demo.json'), { ...project, protectedEnvBranches: [...project.protectedEnvBranches, 'release/current'] });
+    const root = 'repos/example/demo/branches';
+    resetForge('', { branchApi: {
+      [root + '?per_page=100']: { body: [{ name: 'feature_demo' }, { name: 'release/current' }, { name: 'release/old' }, { name: 'feature_123_uat' }] },
+      [root + '/feature_demo/protection']: { body: {} },
+      [root + '/release%2Fcurrent/protection']: { status: 404, stderrOnly: true },
+    } });
+    const data = doctor(config);
+    const item = doctorCheck(data, 'forge-branch-protection');
+    assert.equal(item.status, 'WARN', JSON.stringify(data));
+    assert.equal(data.ok, true, JSON.stringify(data));
+    assert.deepEqual(data.supportedTiers, ['L1', 'L2', 'L3']);
+    assert.match(item.detail, /feature_demo 已保护/);
+    assert.match(item.detail, /release\/current .*HTTP 404/);
+    assert.match(item.fix, /gh api --method PUT 'repos\/example\/demo\/branches\/release%2Fcurrent\/protection' --input branch-protection\.json/);
+    assert.deepEqual(forgeCalls().map((call) => call.args.at(-1)), [root + '?per_page=100', root + '/feature_demo/protection', root + '/release%2Fcurrent/protection']);
+  });
+  for (const [name, fixture, detail] of [
+    ['HTTP 403', { status: 403 }, /HTTP 403/],
+    ['plan restriction', { status: 404, message: 'Upgrade to GitHub Pro or make this repository public to enable this feature' }, /仓库套餐不支持/],
+  ]) {
+    check('doctor GitHub ' + name + ' recommends the Hook without blocking', () => {
+      const root = 'repos/example/demo/branches';
+      resetForge('', { branchApi: { [root + '?per_page=100']: { body: [{ name: 'feature_demo' }] }, [root + '/feature_demo/protection']: fixture } });
+      const data = doctor(CONFIG, ['--project', 'demo']);
+      const item = doctorCheck(data, 'forge-branch-protection');
+      assert.equal(item.status, 'WARN');
+      assert.equal(data.ok, true);
+      assert.match(item.detail, detail);
+      assert.match(item.fix, /hooks\/install-hooks\.mjs/);
+      assert.doesNotMatch(item.fix, /--method PUT/);
+    });
+  }
+  check('doctor GitHub Enterprise uses the project hostname for auth and branch protection', () => {
+    const config = path.join(TMP, 'doctor-ghe');
+    const hostname = 'github.example.test';
+    writeJson(path.join(config, 'me.json'), { user: 'fixture-user' });
+    writeJson(path.join(config, 'projects', 'demo.json'), { ...project, hostname });
+    resetForge('', { captureAuth: true });
+    const data = doctor(config);
+    assert.equal(doctorCheck(data, 'forge-branch-protection').status, 'PASS');
+    assert.deepEqual(forgeCalls().map((call) => call.args.slice(0, call.args[0] === 'auth' ? 4 : 3)), [
+      ['auth', 'status', '--hostname', hostname], ['api', '--hostname', hostname], ['api', '--hostname', hostname],
+    ]);
+  });
+  check('doctor GitLab reads actual branches and paginated protection on the configured instance', () => {
+    const config = path.join(TMP, 'doctor-gitlab-branches');
+    const hostname = 'gitlab.example.test';
+    const repo = 'org/team/demo';
+    writeJson(path.join(config, 'me.json'), { user: 'fixture-user' });
+    writeJson(path.join(config, 'projects', 'demo.json'), {
+      ...project, forge: 'gitlab', gitlabHost: hostname, hubRepo: { ...project.hubRepo, repo },
+      protectedEnvBranches: ['release/*', 'release/current'],
+    });
+    const root = 'projects/org%2Fteam%2Fdemo';
+    const branches = root + '/repository/branches?per_page=100';
+    const rules = root + '/protected_branches?per_page=100';
+    resetForge('', { branchApi: {
+      [branches]: { body: [{ name: 'feature_demo' }, { name: 'release/current' }, { name: 'release/old' }] },
+      [rules]: { body: Array.from({ length: 100 }, (_, i) => ({ name: 'rule-' + i })) },
+      [rules + '&page=2']: { body: [{ name: 'release/*' }] },
+    } });
+    const data = doctor(config);
+    const item = doctorCheck(data, 'forge-branch-protection');
+    assert.equal(item.status, 'WARN');
+    assert.equal(data.ok, true);
+    assert.match(item.detail, /feature_demo 未保护/);
+    assert.match(item.detail, /release\/current 已保护/);
+    assert.doesNotMatch(item.detail, /release\/old/);
+    assert.match(item.fix, /--method POST 'projects\/org%2Fteam%2Fdemo\/protected_branches' --raw-field 'name=feature_demo'/);
+    assert.deepEqual(forgeCalls().map((call) => call.args), [branches, rules, rules + '&page=2'].map((endpoint) => ['api', '--hostname', hostname, endpoint]));
+  });
+  check('doctor reports a remote branch listing failure as unknown', () => {
+    const root = 'repos/example/demo/branches';
+    resetForge('', { branchApi: { [root + '?per_page=100']: { status: 403 } } });
+    const data = doctor(CONFIG, ['--project', 'demo']);
+    const item = doctorCheck(data, 'forge-branch-protection');
+    assert.equal(item.status, 'WARN');
+    assert.match(item.detail, /无法读取.*HTTP 403/);
+    assert.deepEqual(forgeCalls().map((call) => call.args.at(-1)), [root + '?per_page=100']);
+    resetForge('');
   });
   const uninitialized = path.join(TMP, 'uninitialized-config');
   check('doctor uninitialized is WARN and permits L1', () => {
@@ -505,38 +653,6 @@ try {
     const data = doctor(badConfig, ['--project', 'demo']);
     assert.equal(doctorCheck(data, 'config').status, 'BLOCK', JSON.stringify(data));
     assert.match(doctorCheck(data, 'config').detail, /INVALID_CONFIG|解析/, JSON.stringify(data));
-  });
-
-  const reviewed = { hasValidReview: true, reviewVerdict: '通过' };
-  const transitions = [
-    ['non-owner', { fromState: '进行中', toState: '待终审', isOwner: false }, 'NOT_OWNER'],
-    ['skip final review', { fromState: '进行中', toState: '待合并' }, 'SKIP_FINAL_REVIEW'],
-    ['reject fuse', { fromState: '待终审', toState: '待合并', autoMerge: true, mrMeta: { ...reviewed, rejectCount: 2 } }, 'REJECT_FUSE_BLOCK'],
-    ['unresolved blocker', { fromState: '阻断', toState: '进行中' }, 'BLOCK_UNRESOLVED'],
-    ['protected env auto merge', { fromState: '待终审', toState: '待合并', autoMerge: true, mrMeta: { ...reviewed, targetIsProtectedEnv: true } }, 'PROTECTED_ENV_AUTO_MERGE'],
-    ['L1 explicit skip with manual merge', { tier: 'L1', fromState: '进行中', toState: '已合入', allowSkipReview: true, autoMerge: false }, null],
-    ['L1 skip cannot auto merge', { tier: 'L1', fromState: '进行中', toState: '待合并', allowSkipReview: true, autoMerge: true }, 'SKIP_FINAL_REVIEW'],
-    ['reviewed protected branch with manual merge', { tier: 'L2', fromState: '待终审', toState: '待合并', autoMerge: false, mrMeta: { ...reviewed, targetIsProtectedEnv: true } }, null],
-    ['explicit handoff', { fromState: '进行中', toState: '待终审', isOwner: false, isHandoff: true }, null],
-    ['resolved blocker', { fromState: '阻断', toState: '进行中', blockResolved: true }, null],
-    ['resume paused work', { fromState: '暂停（原：进行中）', toState: '进行中' }, null],
-    ['record original state on pause', { fromState: '阻断', toState: '暂停（原：阻断）' }, null],
-    ['paused blocker remains unresolved', { fromState: '暂停（原：阻断）', toState: '进行中' }, 'BLOCK_UNRESOLVED'],
-    ['resume resolved paused blocker', { fromState: '暂停（原：阻断）', toState: '进行中', blockResolved: true }, null],
-    ['fused full review rejection goes to manual verdict', { fromState: '终审中', toState: '待合并', mrMeta: { ...reviewed, rejectCount: 2, reviewVerdict: '打回' } }, null],
-    ['fused full review rejection cannot auto merge', { fromState: '终审中', toState: '待合并', autoMerge: true, mrMeta: { ...reviewed, rejectCount: 2, reviewVerdict: '打回' } }, 'REJECT_FUSE_BLOCK'],
-    ['fused review still needs a valid review', { fromState: '终审中', toState: '待合并', mrMeta: { rejectCount: 2 } }, 'SKIP_FINAL_REVIEW'],
-    ['fused rejected change cannot be marked merged', { fromState: '终审中', toState: '已合入', mrMeta: { ...reviewed, rejectCount: 2, reviewVerdict: '打回' } }, 'SKIP_FINAL_REVIEW'],
-  ];
-  for (const [name, input, expected] of transitions) check(`transition ${name}`, () => {
-    const result = loop(['transition-check', '--input', JSON.stringify({ tier: 'L2', ...input })]);
-    requireExit(result, expected ? 2 : 0);
-    const data = requireJson(result);
-    if (expected) {
-      assert.equal(data.allowed, false, JSON.stringify(data));
-      assert.equal(data.code, expected, JSON.stringify(data));
-      assert.ok(data.reason && data.requiredAction, JSON.stringify(data));
-    } else assert.equal(data.allowed, true, JSON.stringify(data));
   });
 
   const oldBody = '## 1. 基本信息\n主控：第 1 任 ｜ old-session ｜ local\n旧主控';
@@ -659,10 +775,18 @@ try {
     ['unrelated issue with only a ledger in the run', { issues: { main: { id: 12 } } }, 'ISSUE_REF_NOT_IN_RUN'],
   ]) check(`forge issue reference allowlist: ${name}`, () => {
     const file = path.join(TMP, 'issue-refs-run.json');
-    writeJson(file, { repos: [{ repo: 'example/demo' }], baselineBranch: 'loop/demo', ...fields });
-    resetForge('', { pr: { baseRefName: 'loop/demo', headRefName: 'feat/demo', headRefOid: 'fixture-sha', body: 'Refs #41', state: 'OPEN' } });
+    const headSha = 'a'.repeat(40);
+    writeJson(file, { req: 'demo', forge: 'github', autoMerge: true, repos: [{ repo: 'example/demo' }], baselineBranch: 'loop/demo', ...fields });
+    write(file.replace(/\.json$/, '.reviews.jsonl'), [
+      { type: 'dispatch', dispatchId: 'fixture', headSha, session: 'reviewer', nonce: 'fixture',
+        round: 1, at: '2024-05-01T04:00:00Z', pr: { repo: 'example/demo', id: 13 } },
+      { type: 'verdict', dispatchId: 'fixture', conclusion: '通过',
+        risk: { contract: false, hotFile: false, migration: false, switchDefault: false, signature: false, foundation: false } },
+      { type: 'merge-result', dispatchId: 'fixture', state: 'waiting', code: 'DEPENDS_ON_UNMERGED', rejectCount: 0 },
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    resetForge('', { mergeFacts: true, pr: { baseRefName: 'loop/demo', headRefName: 'feat/demo', headRefOid: headSha, body: 'Refs #41', state: 'OPEN', labels: ['需求:demo', '待合并'] } });
     const result = cli(FORGE, ['change-merge', '--forge', 'github', '--repo', 'example/demo', '--id', '13',
-      '--target', 'loop/demo', '--head-sha', 'fixture-sha', '--run', file]);
+      '--target', 'loop/demo', '--head-sha', headSha, '--run', file]);
     requireExit(result, expected ? 2 : 0);
     const data = requireJson(result);
     if (expected) assert.equal(data.code, expected, JSON.stringify(data));
@@ -674,7 +798,7 @@ try {
     mrs: [{ repo: 'example/demo', id: 7, state: 'OPEN', labels: ['槽位yellow', { name: '待终审' }] }],
     escalations: [{ id: 'urgent', slot: 'red', blocking: true, resolved: false }],
   };
-  const statusResult = loop(['status', '--req', 'init-l3', '--live', '--live-input', JSON.stringify(live)]);
+  const statusResult = loop(['status', '--json', '--req', 'init-l3', '--live', '--live-input', JSON.stringify(live)]);
   check('live status places red actions first and nextPrompt follows', () => {
     requireExit(statusResult);
     const data = requireJson(statusResult).live;
@@ -689,17 +813,17 @@ try {
   });
   check('live req selects the exact active demand and rejects a conflicting explicit req', () => {
     const args = ['--live-input', JSON.stringify({ ...live, req: 'init-l3' })];
-    const result = loop(['status', ...args]);
+    const result = loop(['status', '--json', ...args]);
     requireExit(result);
     const data = requireJson(result);
     assert.ok(data.activeRuns.length > 1);
     assert.equal(data.live.overview.req, 'init-l3');
     assert.equal(data.live.overview.tier, 'L3');
-    const conflict = loop(['status', '--req', 'init-l2', ...args]);
+    const conflict = loop(['status', '--json', '--req', 'init-l2', ...args]);
     requireExit(conflict, 2);
     assert.equal(requireJson(conflict).code, 'LIVE_REQ_CONFLICT');
   });
-  check('bare live status reads pending changes and blockers from run.json', () => {
+  check('bare live status uses Forge membership and ignores stale changes and blockers in run.json', () => {
     const file = path.join(CONFIG, 'runs', 'init-l3.json');
     const original = fs.readFileSync(file, 'utf8');
     writeJson(file, {
@@ -708,13 +832,13 @@ try {
       blockers: [{ id: 'still-blocking', slot: 'B' }, { id: 'closed', closed: true }],
     });
     try {
-      const result = loop(['status', '--req', 'init-l3', '--live']);
+      const result = loop(['status', '--json', '--req', 'init-l3', '--live']);
       requireExit(result);
       const data = requireJson(result).live;
-      assert.equal(data.overview.source, 'run');
-      assert.equal(data.overview.totals.needsChanges, 1);
-      assert.equal(data.overview.totals.blockingEscalations, 1);
-      assert.equal(data.actionRequired[0].ref, 'still-blocking');
+      assert.equal(data.overview.source, 'forge');
+      assert.equal(data.overview.totals.needsChanges, 0);
+      assert.equal(data.overview.totals.blockingEscalations, 0);
+      assert.ok(!data.actionRequired.some(({ ref }) => ref === 'still-blocking'));
     } finally {
       write(file, original);
     }
@@ -724,146 +848,29 @@ try {
     requireExit(loaded);
     assert.deepEqual(requireJson(loaded).protectedEnvBranches.slice(-2), ['/^rel_\\d{1,2}$/', 'staging']);
   });
-  const l3Personal = ledgers.L3.find((item) => item.kind === 'slot')?.body ?? '';
-  function policyFindings(body) {
-    const input = { mode: 'lead', tier: 'L3', ledgers: [{ id: 7, slot: 'A', body }] };
-    const result = loop(['eval-patrol', '--input', JSON.stringify(input)]);
-    requireExit(result);
-    return requireJson(result).findings.filter((finding) => finding.code === 'PERSONAL_POLICY_VIOLATION');
-  }
-  for (const text of ['本次小改可以跳过终审', '绕过升级串直接修改契约', '必须先确认代码，然后跳过终审', '直接降低风险等级']) {
-    check(`lead patrol detects section 5 policy: ${text}`, () => {
-      const findings = policyFindings(`${l3Personal}\n- ${text}\n`);
-      assert.ok(findings.length > 0, `actual findings=${JSON.stringify(findings)}`);
-    });
-  }
-  for (const text of ['提交前本人先看，送审前再看', '工作时段 09:00-18:00，只在工作时段提醒', '不得跳过终审，契约变更必须走升级串', '为降低线上风险，提交前先看']) {
-    check(`lead patrol permits section 5 preference: ${text}`, () => {
-      const findings = policyFindings(`${l3Personal}\n- ${text}\n`);
-      assert.deepEqual(findings, [], JSON.stringify(findings));
-    });
-  }
-  check('lead patrol does not mistake rejected history in section 2 for section 5 policy', () => {
-    const body = l3Personal.replace('## 2. 需本人处理', '## 2. 需本人处理\n- 讨论记录：有人提过跳过终审，已经否决');
-    const findings = policyFindings(body);
-    assert.deepEqual(findings, [], JSON.stringify(findings));
+  check('config-resolve and init reject invalid rules before creating a run', () => {
+    for (const rule of ['/(unclosed/', '/^release/g', '/no-delimiter']) {
+      const overrides = JSON.stringify({ protectedEnvBranches: [rule] });
+      for (const args of [['config-resolve'], ['init', '--req', 'bad-pattern', '--branch', 'feature_demo']]) {
+        const result = loop([...args, '--project', 'demo', '--overrides', overrides]);
+        requireExit(result, 2);
+        assert.equal(requireJson(result).code, 'INVALID_BRANCH_PATTERN', describe(result));
+        assert.equal(requireJson(result).pattern, rule);
+      }
+    }
+    assert.equal(fs.existsSync(path.join(CONFIG, 'runs', 'bad-pattern.json')), false);
   });
+  const l3Personal = ledgers.L3.find((item) => item.kind === 'slot')?.body ?? '';
 
-  check('lint and patrol agree on section 5 anchor and body with one trailing newline', () => {
+  check('lint handles section 5 anchor and trailing newline counting', () => {
     const body = l3Personal.replace('流程提醒与规则引用', '流程提醒').trimEnd();
     const maxLines = body.split('\n').length;
     const lint = loop(['ledger-lint', '--tier', 'L3', '--body', `${body}\n`, '--max-lines', String(maxLines)]);
     requireExit(lint);
     assert.equal(requireJson(lint).lineCount, maxLines);
-    for (const input of [
-      { mode: 'small', tier: 'L3', ledger: { body: `${body}\n` } },
-      { mode: 'lead', tier: 'L3', ledgers: [{ body: `${body}\n` }] },
-    ]) {
-      const patrol = loop(['eval-patrol', '--input', JSON.stringify({ ...input, thresholds: { ledgerMaxLines: maxLines } })]);
-      requireExit(patrol);
-      assert.ok(requireJson(patrol).findings.every((finding) => !/^LEDGER_(?:BLOAT|STRUCTURE)/.test(finding.code)));
-    }
     const double = loop(['ledger-lint', '--tier', 'L3', '--body', `${body}\n\n`, '--max-lines', String(maxLines)]);
     requireExit(double, 2);
     assert.equal(requireJson(double).lineCount, maxLines + 1);
-  });
-
-  group('4. conditional retro and privacy');
-  function retroRun(req, tier, extra = {}) {
-    writeJson(path.join(CONFIG, 'runs', `${req}.json`), {
-      req, tier, status: 'active', review: { rejectCount: 0 }, repos: [{ name: 'repo', verificationCommand: 'npm test' }], ...extra,
-    });
-  }
-  function retro(req, facts, flags = []) {
-    const result = cli(RETRO, ['--req', req, '--input', JSON.stringify(facts), '--config-dir', CONFIG, ...flags]);
-    requireExit(result);
-    return requireJson(result);
-  }
-  retroRun('easy-l1', 'L1');
-  retroRun('easy-l2', 'L2');
-  for (const req of ['easy-l1', 'easy-l2']) check(`${req} two first-pass MRs does not trigger`, () => {
-    const data = retro(req, { mrCount: 2, firstPassCount: 2 });
-    assert.equal(data.triggered, false, JSON.stringify(data));
-    assert.deepEqual(data.proposals, [], JSON.stringify(data));
-  });
-  check('unknown first-pass count does not turn into a low first-pass rate', () => {
-    for (const facts of [{ mrCount: 3 }, { mrCount: 3, firstPassCount: null }, { firstPassCount: 0 }]) {
-      const data = retro('easy-l2', facts);
-      assert.equal(data.metrics.firstPassRate, null, JSON.stringify(data));
-      assert.equal(data.triggered, false, JSON.stringify(data));
-    }
-  });
-  check('a known zero first-pass count triggers for two MRs', () => {
-    const data = retro('easy-l2', { mrCount: 2, firstPassCount: 0 });
-    assert.equal(data.metrics.firstPassRate, 0, JSON.stringify(data));
-    assert.ok(data.triggerReasons.some((reason) => reason.code === 'FIRST_PASS_LOW'));
-  });
-  check('explicit rejectCount triggers the same fuse as the run record', () => {
-    const data = retro('easy-l2', { mrCount: 2, rejectCount: 2 });
-    assert.equal(data.triggered, true, JSON.stringify(data));
-    assert.ok(data.triggerReasons.some((reason) => reason.label === '累计打回熔断'));
-  });
-  retroRun('hard-l3', 'L3');
-  retroRun('hard-k2', 'L2', { review: { rejectCount: 2 } });
-  retroRun('hard-rate2', 'L2');
-  retroRun('hard-rate3', 'L2');
-  retroRun('hard-repeat', 'L2');
-  retroRun('hard-temp', 'L2');
-  retroRun('hard-fused', 'L2');
-  const hardCases = [
-    ['hard-l3', { mrCount: 2, firstPassCount: 2 }, 'TIER_L3'],
-    ['hard-k2', { mrCount: 3, firstPassCount: 2 }, null],
-    ['hard-rate2', { mrCount: 2, firstPassCount: 1 }, 'FIRST_PASS_LOW'],
-    ['hard-rate3', { mrCount: 3, firstPassCount: 1 }, 'FIRST_PASS_LOW'],
-    ['hard-repeat', { mrCount: 2, firstPassCount: 2, repeatedCorrections: [{ type: 'same-kind', count: 2 }] }, 'REPEATED_CORRECTION'],
-    ['hard-temp', { mrCount: 2, firstPassCount: 2, tempRules: [{ text: 'temporary fixture rule', effective: true, reusable: true }] }, 'TEMP_RULES'],
-    ['hard-fused', { mrCount: 2, firstPassCount: 2, fusedRejectCount: 2 }, 'FUSED_REJECT'],
-  ];
-  for (const [req, facts, reason] of hardCases) check(`${req} triggers retro`, () => {
-    const data = retro(req, facts);
-    assert.equal(data.triggered, true, JSON.stringify(data));
-    if (reason) assert.ok(data.triggerReasons.some((item) => item.code === reason), JSON.stringify(data));
-  });
-  const secrets = {
-    req: 'SensitiveRequirement_7813', project: 'PrivateProject_7813', user: 'SensitivePerson_7813',
-    branch: 'secret-feature-7813', baselineBranch: 'secret-base-7813',
-    name: 'PrivateRepoName_7813', repo: 'private-org/PrivateRepoName_7813',
-    path: path.join(TMP, 'SensitivePath_7813', 'private-repo'),
-  };
-  retroRun(secrets.req, 'L3', { project: secrets.project, user: secrets.user, branch: secrets.branch,
-    baselineBranch: secrets.baselineBranch, repos: [{ name: secrets.name, repo: secrets.repo, path: secrets.path }],
-    worktrees: [path.join(TMP, 'SensitiveWorktree_7813')] });
-  const hardFacts = { mrCount: 6, firstPassCount: 2, fusedRejectCount: 2, collisionCount: 1,
-    repeatedCorrections: [{ type: `private ${secrets.user}`, count: 2 }],
-    tempRules: [{ text: `private ${secrets.req}`, effective: true, reusable: true }] };
-  check('retro proposals cover three categories with at most five items', () => {
-    const data = retro(secrets.req, hardFacts);
-    assert.equal(data.triggered, true, JSON.stringify(data));
-    assert.ok(data.proposals.length > 0 && data.proposals.length <= 5, JSON.stringify(data.proposals));
-    assert.deepEqual([...new Set(data.proposals.map((item) => item.category))].sort(), ['config-tune', 'project-guard', 'skill-proposal']);
-  });
-  check('retro issue draft excludes demand, repo, branch, absolute path and person', () => {
-    const data = retro(secrets.req, hardFacts);
-    const draft = JSON.stringify(data.issueDraft);
-    for (const secret of Object.values(secrets)) assert.ok(!draft.includes(secret), `draft leaked ${secret}: ${draft}`);
-    assert.ok(!draft.includes(path.join(TMP, 'SensitiveWorktree_7813')), draft);
-  });
-  check('short local terms preserve the tool name and private feedback target stays local', () => {
-    const req = 'xxn';
-    const feedback = 'private-fixture/review-reports';
-    retroRun(req, 'L3', { project: 'lite', user: 'Loop', repos: [{ name: 'cts' }] });
-    const data = retro(req, { mrCount: 1 }, ['--feedback-repo', feedback]);
-    assert.ok(data.issueDraft.markdown.includes('`xxn-lite-loop`'));
-    assert.ok(data.issueDraft.markdown.includes('projects/'));
-    assert.ok(!JSON.stringify(data.issueDraft).includes(feedback));
-    assert.equal(data.submit.target, feedback);
-    assert.ok(!JSON.stringify({ ...data, submit: undefined }).includes(feedback));
-    assert.ok(!JSON.stringify(data.submit.commands).includes(feedback));
-  });
-  check('retro writes no config files or metadata', () => {
-    const before = snapshotTree(CONFIG);
-    retro(secrets.req, hardFacts);
-    assert.deepEqual(snapshotTree(CONFIG), before);
   });
 
   group('5. hook installation, idempotence and uninstall');
@@ -938,6 +945,7 @@ try {
     const installed = path.join(TMP, "installed user's skill");
     write(path.join(packageRoot, 'install.sh'), fs.readFileSync(INSTALL_SH));
     fs.cpSync(path.join(ROOT, 'hooks'), path.join(packageRoot, 'hooks'), { recursive: true });
+    fs.cpSync(path.join(ROOT, 'scripts'), path.join(packageRoot, 'scripts'), { recursive: true });
     const result = execute('/bin/bash', [path.join(packageRoot, 'install.sh'), '--target', installed, '--with-hooks', '--hook-target', 'antigravity']);
     requireExit(result);
     fs.rmSync(packageRoot, { recursive: true });
@@ -987,7 +995,7 @@ try {
   const rulesProject = {
     forge: 'github',
     hubRepo: { name: 'demo', repo: 'example/demo', path: ACTIVE, branch: 'feature_demo' },
-    verification: { commands: {} },
+    verification: { commands: {}, skipReason: 'fixture' },
   };
   function resolveRules(config, extra = []) {
     const result = loop(['config-resolve', '--project', 'demo', ...extra], config);
@@ -1127,22 +1135,6 @@ try {
     assert.equal(item.status, 'WARN', JSON.stringify(data));
     assert.match(item.detail, /L3 个人规矩已拦下 1 条/);
     assert.equal(data.ok, true, JSON.stringify(data));
-  });
-  function rulePatrolFindings(input) {
-    const result = loop(['eval-patrol', '--input', JSON.stringify({ mode: 'lead', tier: 'L3', ...input })]);
-    requireExit(result);
-    return requireJson(result).findings.filter((finding) => finding.code === 'PERSONAL_POLICY_VIOLATION');
-  }
-  check('lead patrol probes personalRules from the ledger and the input', () => {
-    const fromLedger = rulePatrolFindings({ ledgers: [{ id: 7, slot: 'A', personalRules: ['绕过升级串直接改契约'] }] });
-    assert.equal(fromLedger.length, 1, JSON.stringify(fromLedger));
-    assert.match(fromLedger[0].detail, /槽位 A 个人规矩「绕过升级串直接改契约」/);
-    assert.match(fromLedger[0].key, /rules:BYPASS_CONTRACT_OR_HOTFILE$/);
-    const fromInput = rulePatrolFindings({ personalRules: ['免终审直接合'], ledgers: [{ id: 7, slot: 'A' }] });
-    assert.equal(fromInput.length, 1, JSON.stringify(fromInput));
-    assert.match(fromInput[0].detail, /槽位 主研发 个人规矩「免终审直接合」/);
-    const strict = rulePatrolFindings({ personalRules: ['提交前本人先看', '不得跳过终审'], ledgers: [{ id: 7, slot: 'A' }] });
-    assert.deepEqual(strict, []);
   });
 
   group('8. public distribution checks');

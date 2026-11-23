@@ -18,12 +18,16 @@ const MIRROR_ITEMS = [
   '.github', '.gitlab', 'references', 'scripts', 'hooks', 'tests',
 ];
 const PACK_ITEMS = [...SKILL_ITEMS, 'CONTRIBUTING.md', 'install.sh'];
-const IGNORED = new Set(['.git', 'node_modules', '.DS_Store']);
+const IGNORED = new Set(['.git', 'node_modules', '.DS_Store', '.audit']);
 const FORBIDDEN_PATTERNS = [
   { name: 'feishu_user_id', re: /\bou_[0-9a-f]{20,}\b/i },
   { name: 'feishu_chat_id', re: /\boc_[0-9a-f]{24,}\b/i },
   { name: 'personal_abs_path', re: /\/(?:Users|home)\/[^/\s"\x27]+\// },
   { name: 'access_token', re: /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{12,})\b/ },
+  {
+    name: 'feishu_tenant_domain',
+    re: /(?<![a-z0-9.-])(?!open\.feishu\.cn(?![a-z0-9.-])|www\.feishu\.cn(?![a-z0-9.-]))(?:[a-z0-9-]+\.)+feishu\.cn(?![a-z0-9.-])/i,
+  },
 ];
 
 function walkFiles(dir) {

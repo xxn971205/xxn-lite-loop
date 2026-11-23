@@ -6,7 +6,7 @@
  *   - 按每条命令的实际操作目录匹配活跃 Loop 仓库。
  *   - 引号内字符串一律视为普通参数；只分析真正的命令词。
  *   - 只拦 2 类会酿事故的写命令：受保护环境分支的直推/合入、绕过 forge.mjs 的裸合并。
- *   - 自身出错时 fail-open（放行），不让安全栓变成路障。
+ *   - 受保护分支规则无效时拦截受检查的写命令。其它内部异常放行。
  *
  * 两种用法：
  *   1. 作为库：import { evaluateCommand } from './hooks/guard-command.mjs'
@@ -23,11 +23,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { PROD_TRUNKS, ENV_BRANCHES, matchProtectedBranch, validateBranchPatterns } from '../scripts/lib/common.mjs';
+
+export { matchProtectedBranch };
 
 const VERSION = '1.0.0';
 const HOOK_EVENT = 'PreToolUse';
-const DEFAULT_ENV_BRANCHES = ['main', 'master', 'test', 'uat'];
-const TRUNK_BRANCHES = new Set(['main', 'master']);
 const FORGE_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'forge.mjs');
 const BYPASS_HINT = '临时放行：DEV_LOOP_HOOK_BYPASS=1（仅限人工确认后）。';
 
@@ -298,42 +299,11 @@ function commandName(token) {
 /* ------------------------------------------------------------------ */
 
 function protectedPatterns(runs) {
-  const patterns = new Set(DEFAULT_ENV_BRANCHES);
-  for (const entry of runs) {
-    const list = Array.isArray(entry.run?.protectedEnvBranches) ? entry.run.protectedEnvBranches : [];
-    for (const pattern of list) {
-      const text = String(pattern ?? '').trim();
-      if (text) patterns.add(text);
-    }
-  }
-  return [...patterns];
-}
-
-/** 命中返回命中的规则，未命中返回 null。支持精确、通配符与 /正则/。 */
-export function matchProtectedBranch(branch, patterns) {
-  const name = String(branch ?? '').trim();
-  if (!name) return null;
-  for (const raw of patterns) {
-    const pattern = String(raw ?? '').trim();
-    if (!pattern) continue;
-    if (pattern.startsWith('/')) {
-      const m = /^\/(.+)\/([a-z]*)$/.exec(pattern);
-      if (!m) continue;
-      try {
-        if (new RegExp(m[1], m[2]).test(name)) return pattern;
-      } catch {
-        // 非法正则忽略，绝不让配置错误变成拦截
-      }
-      continue;
-    }
-    if (pattern.includes('*')) {
-      const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-      if (new RegExp(`^${escaped}$`).test(name)) return pattern;
-      continue;
-    }
-    if (pattern === name) return pattern;
-  }
-  return null;
+  return [...new Set([
+    ...ENV_BRANCHES,
+    ...runs.flatMap(({ repos }) => repos.map((repo) => repo.branch).filter(Boolean)),
+    ...runs.flatMap(({ run }) => Array.isArray(run?.protectedEnvBranches) ? run.protectedEnvBranches : []),
+  ])];
 }
 
 /** refs/heads/x、refs/remotes/origin/x、origin/x、+x 统一成 x；标签返回 tag。 */
@@ -491,6 +461,7 @@ function evaluatePush(args, ctx) {
   const state = parsePushArgs(args);
   if (state.help || state.dryRun) return null;
   if (state.mirror || state.all) {
+    validateBranchPatterns(ctx.patterns);
     return {
       decision: 'block',
       code: 'PUSH_PROTECTED_BRANCH',
@@ -586,16 +557,19 @@ function parseMergeArgs(args) {
 function evaluateMerge(args, ctx) {
   const state = parseMergeArgs(args);
   if (state.abortLike || state.help) return null;
-  for (const source of state.positionals) {
-    const normalized = normalizeRef(source, null);
+  validateBranchPatterns(ctx.patterns);
+  const sources = state.positionals.length ? state.positionals : ['@{upstream}'];
+  for (const source of sources) {
+    const upstream = source === '@{upstream}' || source === '@{u}';
+    const ref = upstream ? ctx.readGit(['rev-parse', '--symbolic-full-name', '@{upstream}']) : source;
+    const normalized = normalizeRef(ref, null);
     if (!normalized || normalized.tag) continue;
     let name = normalized.name;
     const slash = name.indexOf('/');
     if (slash > 0 && ctx.remotes.has(name.slice(0, slash))) name = name.slice(slash + 1);
     if (!name || name === 'HEAD' || name === '@') continue;
-    if (ctx.trunks.has(name)) continue;
     const pattern = matchProtectedBranch(name, ctx.patterns);
-    if (!pattern) continue;
+    if (ctx.trunks.has(name) || !pattern) continue;
     return {
       decision: 'block',
       code: 'MERGE_PROTECTED_ENV',
@@ -787,7 +761,7 @@ export function findActiveRuns(cwd, configDir, gitDir = null) {
       matches.push({ req: run.req ?? path.basename(entry.name, '.json'), runPath: file, run, repos });
     }
   }
-  matches.sort((a, b) => String(b.run.updatedAt ?? '').localeCompare(String(a.run.updatedAt ?? '')));
+  matches.sort((a, b) => (Date.parse(b.run.updatedAt) || 0) - (Date.parse(a.run.updatedAt) || 0));
   return matches;
 }
 
@@ -815,7 +789,7 @@ function contextFor(cwd, dir, gitDir = null) {
   // remotes / repo 按需探测：放行路径不 spawn git，保证非 git 命令也足够快。
   let remotes = null;
   let repo;
-  const trunks = new Set([...TRUNK_BRANCHES, ...active.flatMap((entry) => entry.repos.map((item) => item.branch).filter(Boolean))]);
+  const trunks = new Set([...PROD_TRUNKS, ...active.flatMap((entry) => entry.repos.map((item) => item.branch).filter(Boolean))]);
   const readGit = (args) => spawnText('git', [...(gitDir ? [`--git-dir=${gitDir}`] : []), ...args], cwd);
   return {
     readGit,
@@ -897,16 +871,31 @@ function evaluateUnsafe({ command, cwd, configDir, env }) {
 
       let ctx;
       let block;
-      if (tool === 'git') {
-        const sub = gitSubcommand(tokens);
-        if (!sub || !['push', 'merge'].includes(sub.name)) continue;
-        const location = gitLocation(sub.globals, commandCwd);
-        ctx = getContext(location.cwd, location.gitDir);
-        if (!ctx) continue;
-        block = sub.name === 'push' ? evaluatePush(sub.args, ctx) : evaluateMerge(sub.args, ctx);
-      } else if (tool === 'glab' || tool === 'gh') {
-        ctx = getContext(commandCwd);
-        if (ctx) block = evaluateForge(tokens, ctx);
+      try {
+        if (tool === 'git') {
+          const sub = gitSubcommand(tokens);
+          if (!sub || !['push', 'merge'].includes(sub.name)) continue;
+          const location = gitLocation(sub.globals, commandCwd);
+          ctx = getContext(location.cwd, location.gitDir);
+          if (!ctx) continue;
+          block = sub.name === 'push' ? evaluatePush(sub.args, ctx) : evaluateMerge(sub.args, ctx);
+        } else if (tool === 'glab' || tool === 'gh') {
+          ctx = getContext(commandCwd);
+          if (ctx) {
+            block = evaluateForge(tokens, ctx);
+            if (block) validateBranchPatterns(ctx.patterns);
+          }
+        }
+      } catch (err) {
+        if (err.code !== 'INVALID_BRANCH_PATTERN') throw err;
+        block = {
+          decision: 'block',
+          code: err.code,
+          title: '活跃需求的受保护分支规则无效',
+          detail: err.message,
+          alternatives: ['运行 loopctl doctor 检查配置，修正规则后重试。'],
+          pattern: err.extra?.pattern ?? null,
+        };
       }
       if (block) {
         const runInfo = { req: ctx.req, runPath: ctx.runPath };
@@ -932,7 +921,7 @@ function evaluateUnsafe({ command, cwd, configDir, env }) {
 
 /**
  * 纯评估入口：只读 run.json 与 git 状态，不写任何文件、不改任何状态。
- * 任何内部异常都 fail-open，避免安全栓自身变成路障。
+ * 非法分支规则由写命令检查处理。其它内部异常放行。
  */
 export function evaluateCommand({ command, cwd, configDir, env } = {}) {
   try {
