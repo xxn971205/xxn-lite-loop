@@ -2909,7 +2909,9 @@ function cmdBrief(flags) {
   const reviewScopeLine = role === 'finalReviewer' && changeRef
     ? (fullReReview
       ? `终审口径：已熔断（已打回 ${rejectCount} 次，fullReReview=true，全量复审）；仅允许就 P0/P1 打回，P2 只能写进 --remaining 遗留建议（只剩 P2 请给「通过」），通过后仍交人裁决`
-      : `终审口径：未熔断（已打回 ${rejectCount} 次，fullReReview=false，${rejectCount === 0 ? '首轮深审' : '普通复审'}）；P0/P1/P2 均可打回，熔断后（累计打回 ≥ ${fuseCount} 次）P2 只能写进 --remaining 遗留建议`)
+      : rejectCount === 0
+        ? `终审口径：首轮深审（全单，熔断前，已打回 0 次，fullReReview=false）：P0/P1/P2 均可打回，问题尽量一次挖透；熔断后（累计打回 ≥ ${fuseCount} 次）P2 只能写进 --remaining 遗留建议`
+        : `终审口径：第 ${activeDispatch?.round ?? rejectCount + 1} 轮复审（熔断前，已打回 ${rejectCount} 次，fullReReview=false）：核上轮必改项与直接影响面，P0/P1/P2 均可打回，问题尽量一次挖透；熔断后（累计打回 ≥ ${fuseCount} 次）P2 只能写进 --remaining 遗留建议`)
     : null;
 
   return [

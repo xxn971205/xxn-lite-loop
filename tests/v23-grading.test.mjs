@@ -885,7 +885,7 @@ test('回归 R2-3：闭合等级标记后紧跟的正文冒号保持原样，裸
   assert.ok(body.includes('3. 【P1】:focus-visible 仍被覆盖'), body);
 });
 
-test('回归 R2-4：入口/证据标签换了 Markdown 强调样式仍判重复并拒收，保留内容与缩进差异', (t) => {
+test('回归 R2-4：入口/证据标签换了 Markdown 强调样式仍判重复并拒收，内容不同时不受影响', (t) => {
   const f = createFixture(t);
   const d = f.dispatch('r2-md-dup');
   const before = f.snapshot();
@@ -898,11 +898,8 @@ test('回归 R2-4：入口/证据标签换了 Markdown 强调样式仍判重复�
   assert.equal(f.readCalls().length, 0);
   assert.deepEqual(f.snapshot(), before);
 
-  // 缩进有差异的证据不误判为重复
-  const prefix = '1. 【P2】文档配置例子缩进差异\n入口：复制示例 YAML\n证据：键层级不同\n';
-  const a = prefix + '  ```yaml\n  parent:\n    child: 5\n  ```';
-  const b = prefix + '  ```yaml\n  parent:\n  child: 5\n  ```';
-  const distinct = f.verdict(d, '打回', ['--must-fix', a, '--remaining', b]);
+  const different = '1. 【P2】详情页空态文案不清\n   入口：GET /orders/:id\n   证据：detail.ts:22 空态不区分原因';
+  const distinct = f.verdict(d, '打回', ['--must-fix', base, '--remaining', different]);
   assert.equal(distinct.code, 0, distinct.stdout);
   assert.deepEqual(distinct.json.grades, { p0: 0, p1: 0, p2: 2 });
 });
@@ -922,4 +919,198 @@ test('回归 R2-5：「通过」传入空白 --must-fix（空串/空格/换行�
     const verdictNote = f.comments().findLast((n) => n.body.includes('liteloop:verdict'));
     assert.match(verdictNote.body, /必改项：\n无\n/);
   }
+});
+
+test('回归 R3-1A：前轮结论待补发、本轮已登记且评论 GET 503 时，仍补发前轮结论并为 #11 派审', (t) => {
+  const f = createFixture(t);
+  const p1 = '1. 【P1】负数库存校验错误\n   入口：POST /orders\n   证据：create.ts:18 复现';
+
+  // 第 1 轮结论落本机但未发布（commentId 为空）
+  const d1 = f.dispatch('r3-prev-pending');
+  const s1 = f.readState();
+  s1.failVerdictPost = true;
+  f.writeState(s1);
+  assert.equal(f.verdict(d1, '打回', ['--must-fix', p1]).json.auditPending, true);
+
+  // 第 2 轮结论已发布（latest 有 commentId，但前轮 d1 仍缺 commentId）
+  f.requeue();
+  const s2 = f.readState();
+  s2.failVerdictPost = false;
+  f.writeState(s2);
+  const d2 = f.dispatch('r3-curr-published');
+  const r2 = f.verdict(d2, '打回', ['--must-fix', p1]);
+  assert.equal(r2.code, 0, r2.stdout);
+  assert.equal(r2.json.auditPending, false);
+  assert.equal(readReviews(f.runPath)[0].commentId, undefined);
+  assert.ok(readReviews(f.runPath)[1].commentId);
+
+  // #10 重入待终审且评论 GET 503，同时同需求 #11 待终审
+  f.requeue();
+  const sOutage = f.readState();
+  sOutage.failReads = true;
+  sOutage.prs[`${REPO}#11`] = { ...sOutage.prs[`${REPO}#10`], headRefName: 'feat/other-r3' };
+  f.writeState(sOutage);
+
+  const tickRes = f.loopctl(['tick', '--req', f.req, '--role', 'controller', '--now', '2026-11-24T05:00:00Z', '--apply']);
+  assert.equal(tickRes.code, 0, tickRes.stdout + tickRes.stderr);
+  const actions = tickRes.json.runs?.[0]?.actions ?? [];
+  assert.ok(readReviews(f.runPath)[0].commentId, '应照常补发前轮 d1 的未发布结论');
+  assert.ok(actions.some((a) => a.code === 'VERDICT_AUDIT_REPUBLISH' && a.refs?.[0]?.id === 10), JSON.stringify(actions));
+  assert.ok(actions.some((a) => a.kind === 'review-dispatch' && a.code === 'dispatch' && a.refs?.[0]?.id === 11), '应照常为 #11 派审');
+  assert.ok(!actions.some((a) => a.kind === 'review-dispatch' && a.code === 'dispatch' && a.refs?.[0]?.id === 10), '应暂停 #10 的派审');
+  assert.ok(actions.some((a) => a.kind === 'facts-error' && a.code === 'EXEC_FAILED'), JSON.stringify(actions));
+});
+
+test('回归 R3-1B：存在未发布本机结论且评论 GET 正常时，评论 201 照常产生 UNREPLIED_COMMENT 提醒', (t) => {
+  const f = createFixture(t);
+  const p1 = '1. 【P1】负数库存校验错误\n   入口：POST /orders\n   证据：create.ts:18 复现';
+
+  const d1 = f.dispatch('r3-unreplied');
+  const s1 = f.readState();
+  s1.failVerdictPost = true;
+  f.writeState(s1);
+  assert.equal(f.verdict(d1, '打回', ['--must-fix', p1]).json.auditPending, true);
+
+  f.requeue();
+  const s2 = f.readState();
+  s2.failVerdictPost = false;
+  s2.comments[f.noteKey].push({
+    id: 201,
+    created_at: '2026-11-24T04:30:00Z',
+    user: { login: 'peer-dev' },
+    body: '提交者 ｜ 主研发 ｜ peer-dev\n【纠偏】请核查库存边界逻辑',
+  });
+  f.writeState(s2);
+
+  const tickRes = f.loopctl(['tick', '--req', f.req, '--role', 'controller', '--now', '2026-11-24T05:00:00Z', '--apply']);
+  assert.equal(tickRes.code, 0, tickRes.stdout + tickRes.stderr);
+  const actions = tickRes.json.runs?.[0]?.actions ?? [];
+  assert.ok(readReviews(f.runPath)[0].commentId, '应补发本机结论');
+  const unreplied = actions.find((a) => a.code === 'UNREPLIED_COMMENT');
+  assert.ok(unreplied, `应产生 UNREPLIED_COMMENT，实际动作：${JSON.stringify(actions)}`);
+  assert.ok(unreplied.refs.some((r) => r.id === 10 && r.commentId === 201), JSON.stringify(unreplied));
+});
+
+test('回归 R3-2：第 1、2 轮 brief 终审口径区分范围且明确 P0/P1/P2 均可打回', (t) => {
+  const f = createFixture(t);
+  const p2 = '1. 【P2】文案待优化\n   入口：GET /orders\n   证据：list.ts:18 复现';
+
+  const d1 = f.dispatch('r3-brief-r1');
+  const b1 = f.loopctl(['brief', '--run', f.runPath, '--role', 'finalReviewer', '--issue', '#15', '--change', '10']);
+  assert.equal(b1.code, 0, b1.stdout + b1.stderr);
+  assert.match(b1.stdout, /首轮深审（全单/);
+  assert.match(b1.stdout, /P0\/P1\/P2 均可打回/);
+
+  assert.equal(f.verdict(d1, '打回', ['--must-fix', p2]).code, 0);
+  f.requeue();
+  f.dispatch('r3-brief-r2');
+  const b2 = f.loopctl(['brief', '--run', f.runPath, '--role', 'finalReviewer', '--issue', '#15', '--change', '10']);
+  assert.equal(b2.code, 0, b2.stdout + b2.stderr);
+  assert.match(b2.stdout, /第 2 轮复审（熔断前/);
+  assert.match(b2.stdout, /核上轮必改项与直接影响面/);
+  assert.match(b2.stdout, /P0\/P1\/P2 均可打回/);
+  assert.match(b2.stdout, /问题尽量一次挖透/);
+  assert.doesNotMatch(b2.stdout, /普通复审/);
+  assert.doesNotMatch(b2.stdout, /仅允许就 P0\/P1 打回/);
+});
+
+test('回归 R3-3：去重兼容不同列表符号（1./- ）与续行缩进及加粗标签，内容不同时不误判', (t) => {
+  const f = createFixture(t);
+  const d = f.dispatch('r3-list-indent-dup');
+  const before = f.snapshot();
+
+  const numbered = [
+    '1. 【P2】列表空态文案不清',
+    '   入口：GET /orders',
+    '   证据：list.ts:18 空态不区分原因',
+  ].join('\n');
+  const bulleted = [
+    '- 【P2】列表空态文案不清',
+    '  **入口：**GET /orders',
+    '  **证据：**list.ts:18 空态不区分原因',
+  ].join('\n');
+
+  const dup = f.verdict(d, '打回', ['--must-fix', numbered, '--remaining', bulleted]);
+  assert.equal(dup.code, 2, dup.stdout);
+  assert.equal(dup.json.code, 'DUPLICATE_REVIEW_ITEM');
+  assert.equal(f.readCalls().length, 0);
+  assert.deepEqual(f.snapshot(), before);
+
+  const other = [
+    '- 【P2】列表筛选重置按钮无提示',
+    '  **入口：**GET /orders?reset=1',
+    '  **证据：**list.ts:44 点击后无反馈',
+  ].join('\n');
+  const ok = f.verdict(d, '打回', ['--must-fix', numbered, '--remaining', other]);
+  assert.equal(ok.code, 0, ok.stdout);
+  assert.deepEqual(ok.json.grades, { p0: 0, p1: 0, p2: 2 });
+});
+
+test('回归 R3-4：--remaining 或 --must-fix 写了参数但缺值报 MISSING_FLAG 且 PR 保持 OPEN', (t) => {
+  const f = createFixture(t, { autoMerge: true });
+  const d = f.dispatch('r3-dangling-flag');
+  const before = f.snapshot();
+
+  const noRemVal = f.verdict(d, '通过', ['--remaining']);
+  assert.equal(noRemVal.code, 2, noRemVal.stdout);
+  assert.equal(noRemVal.json.code, 'MISSING_FLAG');
+  assert.equal(f.readState().prs[`${REPO}#10`].state, 'OPEN');
+  assert.equal(f.readCalls().length, 0);
+  assert.deepEqual(f.snapshot(), before);
+
+  const noMfVal = f.verdict(d, '通过', ['--must-fix']);
+  assert.equal(noMfVal.code, 2, noMfVal.stdout);
+  assert.equal(noMfVal.json.code, 'MISSING_FLAG');
+  assert.equal(f.readState().prs[`${REPO}#10`].state, 'OPEN');
+  assert.equal(f.readCalls().length, 0);
+  assert.deepEqual(f.snapshot(), before);
+
+  // 显式传空白字符串的 --remaining 仍按「无」处理
+  const blankRem = f.verdict(d, '通过', ['--remaining', '  \n ']);
+  assert.equal(blankRem.code, 0, blankRem.stdout);
+  assert.equal(blankRem.json.code, 'LOW_RISK_AUTO_MERGE');
+  const note = f.comments().findLast((n) => n.body.includes('liteloop:verdict'));
+  assert.match(note.body, /遗留建议：\n无\n/);
+});
+
+test('回归 R3-5：同一列表内部（--must-fix 与 --remaining 各自）重复条目报 DUPLICATE_REVIEW_ITEM 且零副作用', (t) => {
+  const f = createFixture(t, { autoMerge: false });
+  const d = f.dispatch('r3-intra-list-dup');
+  const before = f.snapshot();
+
+  const dupList = [
+    '- 【P2】列表空态文案不清',
+    '   入口：GET /orders',
+    '   证据：list.ts:18 空态不区分原因',
+    '- 【P2】列表空态文案不清',
+    '   **入口：**GET /orders',
+    '   **证据：**list.ts:18 空态不区分原因',
+  ].join('\n');
+
+  const inMustFix = f.verdict(d, '打回', ['--must-fix', dupList]);
+  assert.equal(inMustFix.code, 2, inMustFix.stdout);
+  assert.equal(inMustFix.json.code, 'DUPLICATE_REVIEW_ITEM');
+  assert.match(inMustFix.json.message, /第 1 条与第 2 条/);
+  assert.equal(f.readCalls().length, 0);
+  assert.deepEqual(f.snapshot(), before);
+
+  const inRemaining = f.verdict(d, '通过', ['--remaining', dupList]);
+  assert.equal(inRemaining.code, 2, inRemaining.stdout);
+  assert.equal(inRemaining.json.code, 'DUPLICATE_REVIEW_ITEM');
+  assert.match(inRemaining.json.message, /第 1 条与第 2 条/);
+  assert.equal(f.readCalls().length, 0);
+  assert.deepEqual(f.snapshot(), before);
+
+  // 内容不同的两条在同列表内正常通过
+  const distinctList = [
+    '- 【P2】列表空态文案不清',
+    '   入口：GET /orders',
+    '   证据：list.ts:18 空态不区分原因',
+    '- 【P2】分页总数未格式化',
+    '   **入口：**GET /orders?page=2',
+    '   **证据：**list.ts:52 直接拼原始数字',
+  ].join('\n');
+  const ok = f.verdict(d, '通过', ['--remaining', distinctList]);
+  assert.equal(ok.code, 0, ok.stdout);
+  assert.deepEqual(ok.json.grades, { p0: 0, p1: 0, p2: 2 });
 });

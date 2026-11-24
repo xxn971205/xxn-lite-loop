@@ -617,7 +617,7 @@ function parseReviewItems(text, label = '必改项') {
     grades[grade] += 1;
     const normalizedBody = `【${grade.toUpperCase()}】${item.slice(match[0].length)}`;
     const key = normalizedBody.replace(FIELD_LABEL, (_, _em, a, b) => `${a ?? b}：`)
-      .split('\n').map((line) => line.trimEnd()).filter(Boolean).join('\n');
+      .split('\n').map((line) => line.trim()).filter(Boolean).join('\n');
     parsed.push({ index: idx + 1, item: short, grade, key, text: `${match[1] ?? ''}${normalizedBody}` });
   });
   if (!items.length || incomplete.length) {
@@ -627,6 +627,17 @@ function parseReviewItems(text, label = '必改项') {
   if (missingGrade.length) {
     const detail = missingGrade.map(({ index, item }) => `第 ${index} 条（${item}）`).join('；');
     throw new CliError('MUST_FIX_GRADE_MISSING', `${label}的每条必须以【P0】、【P1】或【P2】开头：${detail}`, { missingGrade });
+  }
+  const seen = new Map();
+  const dupes = [];
+  for (const entry of parsed) {
+    const first = seen.get(entry.key);
+    if (first) dupes.push({ first: first.index, index: entry.index, item: entry.item });
+    else seen.set(entry.key, entry);
+  }
+  if (dupes.length) {
+    const detail = dupes.map(({ first, index, item }) => `第 ${first} 条与第 ${index} 条（${item}）`).join('；');
+    throw new CliError('DUPLICATE_REVIEW_ITEM', `${label}中存在重复条目，请只保留一处：${detail}`, { items: dupes });
   }
   return { text: parsed.map((entry) => entry.text).join('\n'), grades, items: parsed };
 }
@@ -664,8 +675,12 @@ function changeVerdict(ctx, flags) {
   if (/[\r\n｜|]/.test(slot)) throw new CliError('INVALID_SLOT', '--slot 不能含换行或分隔符');
   const dispatchId = required(flags, 'dispatch-id');
   const nonce = required(flags, 'nonce');
-  const reviewText = (key, needed = false) => (needed ? required(flags, key) : optional(flags, key, '无'))
-    .replace(/<!--(?=\s*liteloop:verdict\b)/g, '&lt;!--').replaceAll(nonce, '[已隐藏]');
+  const reviewText = (key, needed = false) => {
+    const raw = flags[key];
+    if (raw === true) throw new CliError('MISSING_FLAG', `缺少必填参数 --${key}`);
+    const text = needed ? required(flags, key) : (raw === undefined || String(raw).trim() === '' ? '无' : String(raw));
+    return text.replace(/<!--(?=\s*liteloop:verdict\b)/g, '&lt;!--').replaceAll(nonce, '[已隐藏]');
+  };
   const rawMustFix = reviewText('must-fix', conclusion === '打回');
   if (conclusion === '通过' && rawMustFix.trim() !== '无') {
     throw new CliError('PASS_WITH_MUST_FIX', '结论为「通过」时 --must-fix 只能省略或填「无」；P2 遗留建议请放进 --remaining，有 P0/P1 请改为「打回」');
@@ -1320,7 +1335,7 @@ export function registeredDemandIssues(run) {
  * @typedef {{repo: string, id: number, key?: string, user?: string}} MemberRef
  */
 /** Run 注册对象只提供引用。状态、正文、标签、评论与变更单头部均从 Forge 读取。 */
-export function collectRunFacts(run, { includeBaselines = false, localLedgerKey = null, issuesOnly = false, skipChangeComments = () => false } = {}) {
+export function collectRunFacts(run, { includeBaselines = false, localLedgerKey = null, issuesOnly = false, skipChangeComments = () => false, isolateChangeComments = false } = {}) {
   const facts = {
     req: run.req, tier: run.tier, collectedAt: new Date().toISOString(), ledgers: [], changes: [], subIssues: [],
     errors: [], warnings: /** @type {MembershipWarning[]} */ ([]), slotClaims: [],
@@ -1559,8 +1574,17 @@ export function collectRunFacts(run, { includeBaselines = false, localLedgerKey 
       continue;
     }
     const item = { repo, id, ...change };
-    const comments = skipChangeComments(item) ? [] : attempt(source + ':comments', () => commentsWithReplies(ctx, 'change', repo, id));
-    if (comments) facts.changes.push({ ...item, comments });
+    if (skipChangeComments(item)) {
+      facts.changes.push({ ...item, comments: [] });
+    } else if (isolateChangeComments) {
+      let comments = null;
+      let commentError = null;
+      try { comments = commentsWithReplies(ctx, 'change', repo, id); } catch (error) { commentError = factFailure(source + ':comments', error); }
+      facts.changes.push({ ...item, comments: comments ?? [], ...(commentError ? { commentError } : {}) });
+    } else {
+      const comments = attempt(source + ':comments', () => commentsWithReplies(ctx, 'change', repo, id));
+      if (comments) facts.changes.push({ ...item, comments });
+    }
   }
   facts.warnings = [...warnings.values()];
   return facts;
@@ -1590,10 +1614,6 @@ export function readLinkedOwnership(run, master) {
   const location = file.split('/').map(encodeURIComponent).join('/');
   return runProcess(gh(ctx, ['api', '--header', 'Accept: application/vnd.github.raw+json',
     `repos/${repo}/contents/${location}?ref=${encodeURIComponent(ref)}`]));
-}
-
-export function readChangeComments(run, change) {
-  return commentsWithReplies(runForgeContext(run), 'change', change.repo, change.id);
 }
 
 export function readChangeLabelEvents(run, change) {
