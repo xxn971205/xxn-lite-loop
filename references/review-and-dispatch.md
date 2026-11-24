@@ -1,79 +1,80 @@
-# 独立终审、L3 调度与分支合并规则
+# 独立终审与合入
 
-本文件规定变更单（GitLab MR / GitHub PR）的送审门槛、独立终审、风险分级合并、叠加分支与 L3 主研发独立调度职责。
+## 送审前
 
-## 一、开发标准与送审硬门槛
+- 围绕用户确认的业务流程、交互和契约改。保留存量接口、表和消息的兼容性。开关关闭时保持原有业务行为。
+- 按工程档案的 `verification.mode` 交证据。`isolated-build` 交编译、约定的隔离测试和人工冒烟步骤。`local-test` 交受影响测试与实际运行证据。`hybrid` 同时交构建测试和关键路径实测。
+- 用 `forge.mjs change-create --req <slug>` 建单。PR/MR 正文关联需求子 Issue 或 L1 追踪 Issue。跨仓写完整引用。写明契约版本、公共文件变更、外部接口或 SDK、验证、兼容与回退。叠加单写 `Depends-On: <repo!id 或 repo#id>`。非持有者在公共文件末尾追加时写明原因。
+- 开发前用 `forge.mjs baseline-check` 检查远端。无冲突就在原候选分支追加提交。与需求基线确实有冲突时才在原候选分支上 rebase 到最新基线，用 `git push --force-with-lease` 更新；候选分支只归开发本人，已合入基线的历史不改写。解决冲突后标「待终审」重新送审，候选 SHA 变化会作废原终审。禁止把基线 merge 进源分支，否则会被 `SOURCE_CONTAINS_MERGE_COMMITS` 拦下。需求基线用 merge commit 保留审阅轨迹。
 
-1. **最小精准改动**：围绕已定业务流程、交互与契约实现，不顺手重构、不改存量接口/表/MQ 原有字段（只增不改删）、开关关闭必须等于现状、不对不可达情形加防御兜底。
-2. **多仓验证自适应**：按工程档案 `verification.mode` 达标后才可打「待终审」：
-   - `isolated-build`（本地无法启服务的后端）：编译/打包通过 + 验收方案点名处写隔离单测 + PR/MR 描述含人工冒烟步骤；
-   - `local-test`（本地可运行的工具/前端/服务）：全量或受影响模块单测通过 + 实际运行/CLI/浏览器自验证据；
-   - `hybrid`：同时满足受影响模块构建单测与关键路径实测。
-3. **PR/MR 描述必备项**：关联 `hubRepo` 对应 Issue（跨仓写完整引用如 `org/hub#id`）、所基契约版本、是否触及契约/热点文件（非持有者末尾追加须声明）、叠加依赖（标准格式 `Depends-On: <repo!id 或 repo#id>`）、外部接口与 SDK 状态、验证证据或冒烟步骤、存量影响与回退方案。
-4. **提交前先 rebase 到最新需求基线**；统一 `merge commit`（禁 squash，保留清晰审阅轨迹）。
+## 独立终审
 
-## 二、审查必改边界与 6 条高风险判定
+每个 PR/MR 的每轮终审用新会话，优先独立子代理和跨厂商模型。L1/L2 用 `--role controller`，L3 只由主研发调度用 `--role dispatch`。收到 `review-dispatch` 后按引用读取固定候选，为将启动的独立终审分配一个新会话标识，再登记派审。
 
-**审查必改边界**：只打回已支持业务入口中**可达且有实证**的行为错误、交互错误、契约/存量兼容/数据或生产缺陷（写清入口、触发条件、预期与实际后果、源码调用链或运行复现证据）。缺乏可达路径的假想边界、代码风格和写法偏好**只留线索，不打回、不阻塞**。
+```bash
+node scripts/forge.mjs dispatch-review --run "$run_file" --role "$role" \
+  --forge "$forge" --repo "$repo" --id "$change_id" --head-sha "$head_sha" \
+  --session "$review_session" --by "$dispatch_session"
+```
 
-**高风险判定（满足任一条即判「风险高」，否则为「风险低」）**：
-1. 涉及契约字段或对外接口（含 MQ、RPC/Dubbo、OpenAPI）。
-2. 修改公共热点文件或其他槽位持有文件的已有内容（末尾声明追加不算）。
-3. 数据表结构或存量数据迁移变更。
-4. 改变开关默认值，或改写开关关闭时会执行的存量逻辑。
-5. 修改其他槽位或关联仓会调用的接口/方法签名。
-6. 地基 PR/MR 或共用构建配置（如根 `pom.xml` / 顶层依赖锁文件）。
+L3 的 `--by` 必填，传派审方调度会话的实际标识，供公开评论签名。`--session` 传新终审会话的标识。L1/L2 主控可省略 `--by`，脚本用台账第 1 节的主控标识签名。
 
-## 三、独立终审协议（L1 / L2 / L3 全适用）
+自建 Forge 实例在 `dispatch-review` 和 `verdict` 中都传运行态对应的 `--hostname`。`dispatch-review` 写入本机登记簿、发布派审评论并切换到「终审中」。
 
-- **一 PR/MR 一全新终审，优先独立子代理，审完即毁**：使用最强判断或跨厂商独立模型，不设常驻终审轮询。在支持独立子代理的宿主（如 T3 Code）优先通过独立子代理执行每轮终审，**非必要不新建顶层会话**（避免污染顶层会话列表），同一 PR/MR 同轮已派出的不重复创建。**不因提交人是主研发或 L1/L2 单人开发而免终审。**
-- **结论前校验（防超时重派并发污染）**：终审发布结论前必须重读 PR/MR；若本轮无「已派终审」记录，或最新记录对应会话不是自己，立即静默退出，不发结论。
-- **固定结论格式**：
-  ```text
-  角色 ｜ 槽位 ｜ 会话标识
-  结论：通过 / 打回（第 N 轮）
-  必改项：
-  1. 业务入口与触发条件 ｜ 预期及实际后果 ｜ 源码或运行证据 ｜ 期望改法
-  不要改动的范围：……
-  风险：高 / 低 ｜ 理由（对照 6 条逐项说明）
-  ```
-- **只审不改**：终审会话不改代码、不改标签、不执行合并。
-- **有效轮次**：提交方修复后重新打「待终审」开启新轮，此前各轮结论作废；超时重派不算新轮，旧会话误发结论由调度/主控回复「已作废：已重派」。
+用 `loopctl.mjs brief` 生成任务说明，另附 `dispatch-review` 返回的 `dispatchId`、`nonce`、`round`、`headSha` 和 `session`。nonce 只交独立终审。终审在派审方本机运行，重读 PR/MR 确认候选 SHA 后发一次结论。
 
-## 四、终审结果分流、叠加依赖与累计打回熔断
+必改项须能从支持的业务入口触发，并有源码调用链或运行证据。写清用户实际看到什么、期望是什么、为何受影响。风格偏好或缺乏可达入口的疑点留作线索。普通复审核必改项和直接影响。叠加单只审前置提交之后的 diff。派审动作标 `fullReReview` 时做全量复审。
 
-（L1/L2 由主控按同规则执行；L3 **仅由主研发独立调度执行**，不区分提交人。）
+发布前填写实际轮次、派审时的完整 SHA 和本会话标识。下面是六项均已核验且均未命中时的命令。
 
-### 1. 累计打回熔断（`k ≥ 2`）
+```bash
+node scripts/forge.mjs verdict --run "$run_file" --dispatch-id "$dispatch_id" --nonce "$nonce" \
+  --forge "$forge" --repo "$repo" --id "$change_id" \
+  --round "$round" --conclusion 通过 --head-sha "$head_sha" --session "$review_session" --slot "$slot" \
+  --risk contract=0,hotFile=0,migration=0,switchDefault=0,signature=0,foundation=0
+```
 
-每执行一条有效的打回结论，评论「打回第 k 次」（k 从 1 累加，重派不减）。当历史累计 `k ≥ 2` 后提交方再次打「待终审」：
-- 派出终审必须明确标「**全量重审**」；
-- 结论出后**不再自动分流**，一律「终审中」换「待合并」，并在台账第 2 节列 `[待裁决] PR/MR 链接`；
-- 由本人（L1/L2）或主研发（L3）写【裁决】：`继续修改`（换「需修改」） / `接受合并`（本人手合） / `拆分`（换「需修改」按裁决拆分）。
+命中的风险项填 `1`。六项依次是改契约或对外接口、改删公共热点或其他槽位文件的已有内容、表结构或存量数据迁移、改开关默认值或关闭时的存量逻辑、改其他槽位或关联仓使用的方法签名、改地基或公共构建配置。文件末尾追加需声明。按需要加 `--must-fix "$must_fix"` 和 `--keep "$keep"`。
 
-### 2. 一般终审结果分流
+用 `--conclusion 打回` 时须传 `--must-fix`。按行首编号或 `- ` 分条，每条都填实「入口：」和「证据：」，规则见 [终审角色](roles.md#final-reviewer)。字段缺失或仅有 Markdown 强调符时报 `MUST_FIX_INCOMPLETE`，结论不落地。「通过」结论可省略 `--must-fix`。
 
-| 终审结论与条件 | 动作 | 合并执行方 |
-| --- | --- | --- |
-| 不通过（打回，且非全量重审） | 「终审中」换「需修改」，评论「打回第 k 次」；提交方同分支只改必改项追加提交并逐条回复，换回「待终审」（一般复审仅核必改项与增量） | 不合并 |
-| 通过 + 风险高（或缺失风险逐项判定） | 「终审中」换「风险高」「待合并」 | 本人（L1/L2）或主研发本人（L3） |
-| 通过 + 风险低 + 自动合并开启 + 目标为确认的需求基线 + `headSha` 与派审一致 + 无未合 `Depends-On` | 「终审中」换「风险低」，调用 `forge.mjs change-merge --head-sha <sha> --target <baseline>` 自动合并（合并前从 Forge 复读真实目标、head SHA 与正文全部 `Depends-On` 并核验已合入），成功后不留「待合并」，评论「终审通过｜风险低｜自动合并」 | 主控（L1/L2）或主研发调度（L3） |
-| 通过 + 风险低 + 自动合并关闭 / 存在未合 `Depends-On` / `headSha` 漂移 / 目标命中环境分支 | 换「风险低」「待合并」（目标命中环境分支或 SHA 漂移直接拒合待人处理） | 前置合入/人确认后处理 |
-| 合并冲突 | 换「需修改」，评论「合并冲突，需 rebase」；rebase 后重打「待终审」（非全量重审仅复审 rebase 差异；若已处于 `k≥2` 全量重审，仍按熔断规则交人裁决） | 解冲复审后处理 |
+```bash
+must_fix=$(cat <<'EOF'
+1. 订单提交空商品列表时返回 500，期望返回 400 并提示商品不能为空
+   入口：下单页点击「提交」→ POST /api/orders
+   证据：src/order/create.ts:42 直接读取 body.items[0].sku 未判空，传入 {"items":[]} 抛出 TypeError
+2. 取消订单后库存未回滚，导致可售数持续偏低
+   入口：订单详情点击「取消订单」→ POST /api/orders/:id/cancel
+   证据：src/order/cancel.ts:18 仅更新订单状态，未调用 inventoryService.release
+EOF
+)
+node scripts/forge.mjs verdict --run "$run_file" --dispatch-id "$dispatch_id" --nonce "$nonce" \
+  --forge "$forge" --repo "$repo" --id "$change_id" \
+  --round "$round" --conclusion 打回 --head-sha "$head_sha" --session "$review_session" --slot "$slot" \
+  --risk contract=0,hotFile=0,migration=0,switchDefault=0,signature=0,foundation=0 \
+  --must-fix "$must_fix" --keep "保留原有支付回调签名校验逻辑"
+```
 
-### 3. 叠加分支与环境分支红线
+命令先核对本机当前派审、nonce、轮次、会话和 Forge 上的完整 head SHA，再登记结论、发审计评论。发布失败时，下次 `tick --apply` 补发。也可用 `forge.mjs verdict --republish --run <运行态路径> --forge <forge> --repo <repo> --id <变更编号> --dispatch-id <派审 ID>` 补发已登记的正文。评论仅供审计，合入由同一次 `verdict` 按本机登记和实时门禁决定。
 
-- **叠加分支（Stacked PR/MR）**：允许基于「待终审」分支继续开发，必须在描述写 `Depends-On: <前置引用>`；`forge.mjs change-merge` 合并前强制从 PR/MR 正文解析全部 `Depends-On` 并向 Forge 逐条核查均已 `merged`（不信任调用方自报状态），否则拒绝自动合并。终审只审前置之后的 commit diff。
-- **环境分支双向红线与 Git 血统白名单**：
-  1. **生产主干（`main` / `master` 及工程登记的仓默认主干）**：允许向需求基线建单并由**人**确认回合（禁止 AI 自动合入基线）；需求基线向生产主干的合入一律由人执行（L3 主干仅主研发本人合并）。
-  2. **非主干公共环境分支（`test` / `uat` 及工程档案 `protectedEnvBranches` 支持的精确名、`*` 通配符与 `/正则/`，如 `/^feature_\d{4}[A-Z]?_(test|uat)$/`）**：**双向硬拒绝**——既不准 AI 自动合入，也严禁作为源分支向需求基线建单（`change-create`）或合入（`change-merge`）。合入 `test/uat/main` 遇冲突时，从需求基线拉冲突解决分支仅向目标环境提 PR/MR，**严禁将冲突或环境分支反向合回需求基线**。
-  3. **Git 提交血统白名单（防陌生需求分支与“借壳污染”）**：`init` 记录各仓需求基线起点 `baselineStartSha`；`forge.mjs change-merge` 合并前核验真实源分支 `merge-base(origin/基线, origin/源分支)` 不早于 `baselineStartSha`（否则 `SOURCE_LINEAGE_INVALID`），且待合区间 `origin/基线..origin/源分支` 不含任何 merge commit（否则 `SOURCE_CONTAINS_MERGE_COMMITS`，要求 rebase），同时核验 PR/MR 正文（排除 `Depends-On` 行后）关联本次需求 Issue（`MISSING_ISSUE_REF`）。GitLab 项目若仓级设为 fast-forward/强制 squash，或 GitHub 开启合并队列时，须与仓级合并策略对齐后再启用自动合并。
-- **全量审阅 Draft PR/MR**（L2/L3 可选）：从 P2 起在各参与仓各建 1 个「需求基线 → 主干」Draft PR/MR，随基线自动更新，供主研发持续观察包含低风险自动合入在内的全部 diff。
+## 结论分流与人工决定
 
-## 五、L3 主研发独立调度职责（防主研发写码阻塞全组）
+打回时 `verdict` 标「需修改」。通过并满足门禁时，`verdict` 带候选 SHA 当场合并。源分支包含相对基线新增的 merge commit 时标「需修改」。在原候选分支用 `git rebase origin/<需求基线>` 变基到最新需求基线（默认不保留 merge commit），仅保留本次需求提交，再用 `git push --force-with-lease` 更新原 PR/MR 后重送，保留打回次数和升档依据。出现未合入的前置依赖或临时故障时，标「待合并」并登记等待自动重试。全人工模式、高风险、熔断或其他分支门禁拒绝合并时交人处理，命令输出原因。没有本机派审登记的「通过」评论只能交人工核对。
 
-L3 模式下在主研发本机另设独立会话「主研发调度」（30m 周期，窗口重叠 `+10` 分钟），**只做两件事**：
-1. **全局终审与合入流水线**：扫描所有勾选子仓的「待终审」「终审中」PR/MR → 派终审会话、超时重派（2h）、按有效结论切标签与自动合并低风险无依赖项、处理 `k≥2` 熔断登记。
-2. **总台账事实同步与跨槽位基线通知**：仅在 GitLab/GitHub 有变化时同步总台账事实类（进度计数、筛选链接、未裁决升级、各人依赖、契约版本）；判断类（裁决、切阶段、整体风险）只按主研发明确指示写入。当合入影响其他槽位公共接口/组件/依赖时，向受影响槽位小台账发一条【基线变更】评论（附仓库、基线、PR/MR、合入 SHA 与复核要点）。
+`local-test` 的合并前试合在全新临时检出里合并已核对的基线和候选 SHA，验证命令需自带依赖安装步骤。通过后，脚本在请求平台合并前再次核对远端基线。基线变化时返回 `TRIAL_BASE_MOVED`，下一轮 `tick` 用新基线重新试合。再次核对到平台执行合并之间仍有短暂的竞争窗口。平台排队会延长这个窗口。合入日志和评论保留试合时的基线证据。
 
-**红线**：调度绝不推进任何槽位业务 Issue，不派开发/拆分/自审，不改任何小台账正文，不代裁决。
+L1/L2 由主控运行 `loopctl.mjs tick --req <slug> --role controller --apply`。L3 由主研发调度运行 `loopctl.mjs tick --req <slug> --role dispatch --apply`。脚本安排派审、超时重派、补发审计评论，并按本机等待记录重试合入。L1 默认手动触发。打回次数取本机与 Forge 有效打回评论数的较大值，派审轮次和已用会话仍保留 Forge 历史记录。
+
+- 提交方按有效打回结论在原分支追加修改，逐条回执，再打「待终审」开启新轮。超时或候选变化后重新派审，轮次取本机及 Forge 已见最大轮次加一。
+- 全量重审待裁决时，在个人或总台账相应待办找到变更单。由本人或 L3 主研发裁决继续修改、手工接受合并，或拆分后重审。用 `forge.mjs reply` 落对应裁决。
+- 自动合入实查候选提交、目标分支、前置依赖、需求 Issue 归属和 Git 提交来源。仓级合并策略须允许 merge commit。需要手动触发已登记的自动重试时，用 `forge.mjs change-merge --head-sha <sha> --target <基线> --run <运行态文件>`，沿用同一门禁。
+- `change-merge` 省略 `--run` 时只预览命令。
+- 合并方式见 `status` 首段。在运行中用 `loopctl.mjs merge-mode --req <slug> --manual|--auto` 切换，确认单阶段按 [合并方式](lifecycle.md#合并方式) 修改。
+- 生产主干和公共环境分支由人合入，L3 主干由主研发合入。从生产主干同步回需求基线也须人确认。环境分支和环境冲突解决分支禁止反向并入需求基线。冲突时从需求基线拉分支，仅向目标环境提单；门禁由 `change-create`、`change-merge` 执行。
+- L2/L3 可从地基阶段起按仓建「需求基线 → 主干」Draft PR/MR，供主研发看完整 diff。合并冲突按送审前的基线流程解决，然后按对应范围复审。
+
+## L3 主研发调度
+
+先跑 `node <skill>/scripts/loopctl.mjs tick --req <slug> --role dispatch --apply`，无输出即结束本轮。看到 `facts-error` 时说明读取或核验失败的来源，暂停依赖该事实的动作。遇到 `needsLlm: false` 只记录脚本回执。
+
+收到 `review-dispatch` 时用 `--role dispatch --by <本调度会话标识>` 登记派审，留下轮次、独立终审会话标识和候选 SHA。终审用 `verdict` 当场处理结论，跨槽位基线通知和总台账事实计数由 `tick` 执行。调度会话只负责派审，槽位业务交各自主控，切阶段和裁决交主研发。

@@ -1,39 +1,34 @@
 # xxn-lite-loop
 
-一套**用完即弃**、只管需求交付节奏与底线的 AI 轻量工程推进环（MIT License）。
+用一句话启动一个需求，在 GitHub 或 GitLab 上看到进度、独立终审和待你决定的事。合入后两步拆架，停本次任务、关台账、核验并归档。支持个人小需求 L1、个人复杂需求 L2 和多人协作 L3。
 
-- **只管机制，不干涉你用什么工具/编码风格**：无论用 T3 Code、Codex、Claude Code 还是 Gemini，无论个人开发怎么写码怎么测，Loop 只守住「需求建构与纵向拆分标准 + Git 唯一真相基地 + 独立审查 + 防误合门禁 + 收尾零残留」。
-- **核心基地在 GitLab / GitHub，本机配置在仓外**：长期偏好与工程档案存在 `~/.config/dev-loop/`，绝不污染业务仓库 `AGENTS.md` 或主干分支；需求上线后两步拆架归档，业务仓 0 残留。
-- **三档按需平滑升档**：单人极轻 **L1** → 个人多仓自动推进 **L2** → 多人并行 **L3**（支持总台账临时规范热同步、个人偏好不破公共门禁、大巡检 5 条客观探针）。
-- **三层大白话协作规矩**：`me.yaml` / 工程档案 / 本次覆盖各写 `rules: ["一句话一条规矩"]`，按个人 → 工程 → 临时合并，确认单带一行摘要；只收协作与风控规矩（编码规范请放仓库 `AGENTS.md`），每层 ≤5 条、单条 ≤80 字、合计 ≤10 条只提醒不截断，L3 个人规矩不得绕过公共门禁。
-- **脚本确定性守卫 + 可选薄 Hook + 条件触发纯机制复盘**：内置 `doctor` / `ledger-lint` / `transition-check` / `status --live` / `--expect-owner` 写前锁 / `retro`，并可选加装零误杀正常 `git` 命令的薄 Hook 安全栓。
+## 安装
 
-## 1 分钟安装（需 Node.js 20+、Git、已登录 `glab` 或 `gh`）
+需要 Node.js 20+、Git 和已登录的 `gh` 或 `glab`。
 
 ```bash
 bash install.sh
-# 如需可选加装防裸推主干 / 防裸 merge 的薄 Hook 安全栓（仅活跃 Loop 目录生效，0 误杀正常 git 命令）：
+# 可选安装本机防误推、误合提醒
 bash install.sh --with-hooks
 ```
 
-重启 AI 客户端或新开会话后，直接说人话触发（首次自动 4 题向导建好本机档案，无需手写 YAML）：
+新开 AI 会话。首次运行会一次问四个问题并自动写本机档案。开始时核对确认单上的仓库、验证命令、模型和合入方式，回复「确认」。
 
-1. **一句话启动需求**：`$xxn-lite-loop 给这个工程加一个导出 Markdown 的功能`
-2. **加入同事建好的 L3 需求**：`$xxn-lite-loop 加入 <需求总看板 Issue 链接>`
-3. **随时查进度 / 卡点**：`$xxn-lite-loop 现在什么进度，我接下来该干嘛`
-4. **中途平滑升档**：`$xxn-lite-loop 把当前需求从 L1 升档到 L2`
-5. **收尾复盘与拆架**：`$xxn-lite-loop 收尾拆架`
+升级到 v2.2 时，已有 `local-test` 工程档案需在 `verification.commands` 补上各仓试合命令，或用 `verification.skipReason` 写明跳过原因，否则启动新需求会报 `MISSING_VERIFICATION`。试合命令在全新检出里运行，需自行安装验证依赖。 [工程档案示例](references/lifecycle.md#projectsdemoyaml)
 
-## 目录结构
+| 想做什么 | 对 AI 说 |
+| --- | --- |
+| 启动需求 | `$xxn-lite-loop 给这个工程加一个 Markdown 导出功能` |
+| 加入团队需求 | `$xxn-lite-loop 加入 <总台账链接>` |
+| 知道卡在哪 | 在巡检会话说「现在进度怎样，要我做什么？」L1 可问主控。 |
+| 让更复杂的需求继续跑 | `$xxn-lite-loop 把当前需求从 L1 升到 L2` |
+| 设置飞书通知 | 在巡检会话说「往 XX 群推送」或「别发群了」。 |
+| 完成后关闭需求流程 | `$xxn-lite-loop 收尾拆架` |
 
-- `SKILL.md` 与 `references/`：主入口、档位阈值、生命周期、主控路由、独立终审、巡检通知与模板。
-- `scripts/loopctl.mjs`：配置四级合并与三层协作规矩（`rules`）、状态机、升档、拆架与守卫/复盘统一入口。
-- `scripts/guard.mjs`：`doctor`、`ledger-lint`、`transition-check`、`status --live` 与 L3 个人约定红线检查。
-- `scripts/retro.mjs`：客观门槛触发的纯 Loop 机制复盘引擎（纯只读，支持生成脱敏 Issue 提案）。
-- `scripts/forge.mjs`：GitLab (`glab`) / GitHub (`gh`) 统一适配层（含写前锁 `--expect-owner` 与 Git 分支血统门禁）。
-- `hooks/guard-command.mjs` & `hooks/install-hooks.mjs`：可选薄安全栓与非破坏性安装器。
-- `tests/`：全流程离线模拟测试与守卫/Hook 多轮压测套件。
+## 查看记录
 
-## 反馈与演进
+Git 上的台账和签名评论记录事实。开巡检会话问细节，或用 `node scripts/loopctl.mjs status --req <slug>` 看进度、待办、本机最近唤醒和巡检脚本评论。程序用 `--json` 取数据，加 `--live` 查代码平台实况。
 
-本仓库采用**只读发布模式**（主分支受保护，不直接合并外部 PR）。欢迎通过 Issue 模板反馈 Bug 或提交 `loopctl.mjs retro` 生成的脱敏机制优化提案，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+每次定时唤醒先由脚本查台账和变更单。脚本完成机械检查，并把执行结果留在记录里。有需要判断的内容才交给相应会话。生产主干与公共环境分支由人合入。个人偏好和工程配置默认放在 `~/.config/dev-loop`。
+
+角色入口、七条底线与按场景查找的文档在 [SKILL.md](SKILL.md)。使用反馈和脱敏的流程改进提案可走 Issue。 [贡献说明](CONTRIBUTING.md)

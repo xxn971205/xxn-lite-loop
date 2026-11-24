@@ -5,7 +5,6 @@
  * 零依赖 Node.js ESM（Node 20+）。状态守卫由 loopctl.mjs 路由调用：
  *   runDoctor(flags, configDir, opts)  只读环境体检：能不能跑、能跑到哪一档
  *   runLedgerLint(flags)               台账 4 条硬伤：行数、固定章节、状态枚举、围栏代码块
- *   runTransitionCheck(flags)          状态机 5 条红线：主控、漏审、熔断、阻断、环境分支
  *   checkPersonalPolicyOverride(text)  个人临时约定是否试图削弱 L3 公共硬底线
  *   buildLiveStatus(baseStatus, live, run) 单屏健康视图：overview / actionRequired / slotHealth / nextPrompt
  *
@@ -20,6 +19,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { forgeHostArgs, matchProtectedBranch } from './lib/common.mjs';
+import { escalationsFor, ledgerField } from './lib/tick-dispatch.mjs';
 
 const NODE_MIN_MAJOR = 20;
 const LOOPCTL = fileURLToPath(new URL('./loopctl.mjs', import.meta.url));
@@ -73,58 +74,6 @@ function expandHome(target) {
   if (text === '~') return os.homedir();
   if (text.startsWith('~/') || text.startsWith('~\\')) return path.join(os.homedir(), text.slice(2));
   return text;
-}
-
-/** `--input` / `--live-input` 同时支持内联 JSON 与 `@file`（与 loopctl 的 parseJsonArg 一致）。 */
-function readJsonArg(flags, key, { required = true } = {}) {
-  const raw = flagText(flags, key);
-  if (raw === null) {
-    if (!required) return null;
-    throw new CliError('MISSING_FLAG', `缺少必填参数 --${key}`);
-  }
-  let text = raw;
-  if (raw.startsWith('@')) {
-    const file = path.resolve(expandHome(raw.slice(1)));
-    try {
-      text = fs.readFileSync(file, 'utf8');
-    } catch (err) {
-      throw new CliError('FILE_READ_FAILED', `无法读取 --${key} 文件：${file}（${err.message}）`);
-    }
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (err) {
-    throw new CliError('INVALID_JSON', `--${key} 不是合法 JSON：${err.message}`);
-  }
-  if (!isPlainObject(parsed)) throw new CliError('INVALID_JSON', `--${key} 必须是 JSON 对象`);
-  return parsed;
-}
-
-function splitPatterns(value) {
-  if (value == null || value === true) return [];
-  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
-  const text = String(value).trim();
-  if (text.startsWith('[')) {
-    try {
-      const parsed = JSON.parse(text);
-      if (Array.isArray(parsed)) return splitPatterns(parsed);
-    } catch { /* fall back to the delimited form */ }
-  }
-  const patterns = [];
-  let start = 0;
-  let inRegex = false;
-  for (let i = 0; i < text.length; i += 1) {
-    const char = text[i];
-    if (char === '\\' && inRegex) i += 1;
-    else if (char === '/' && (inRegex || !text.slice(start, i).trim())) inRegex = !inRegex;
-    else if (char === ',' && !inRegex) {
-      patterns.push(text.slice(start, i).trim());
-      start = i + 1;
-    }
-  }
-  patterns.push(text.slice(start).trim());
-  return patterns.filter(Boolean);
 }
 
 function positiveInt(value, key) {
@@ -202,8 +151,8 @@ function binaryOnPath(name, env = process.env) {
   }));
 }
 
-function probeForgeCli(bin, probe, cwd) {
-  const result = probe(bin, ['auth', 'status'], { cwd, timeout: 20000 });
+function probeForgeCli(bin, probe, cwd, host) {
+  const result = probe(bin, ['auth', 'status', ...forgeHostArgs({ hostname: host })], { cwd, timeout: 20000 });
   const detail = firstLine(`${result.stdout ?? ''}\n${result.stderr ?? ''}`);
   if (result.error) {
     const missing = /ENOENT|not found|not recognized/i.test(String(result.error));
@@ -234,6 +183,83 @@ function resolveConfigViaCli({ configDir, project, probe, cwd }) {
 
 function check(id, status, detail, fix) {
   return fix ? { id, status, detail, fix } : { id, status, detail };
+}
+
+function probeForgeNames(read, endpoint) {
+  const names = [];
+  for (let page = 1; ; page += 1) {
+    const result = read(endpoint + '?per_page=100' + (page === 1 ? '' : '&page=' + page));
+    const rows = parseMaybeJson(result.stdout);
+    if (result.status !== 0 || result.error || !Array.isArray(rows) || rows.some((row) => typeof row?.name !== 'string')) {
+      throw new Error('无法读取 ' + endpoint + '（' + (result.error || firstLine(result.stderr) || '返回格式异常') + '）');
+    }
+    names.push(...rows.map((row) => row.name));
+    if (rows.length < 100) return names;
+  }
+}
+
+function shellWord(value) {
+  return "'" + String(value).replaceAll("'", "'\\''") + "'";
+}
+
+function checkForgeBranchProtection(cfg, forge, { probe, cwd, env, loggedIn, host }) {
+  const id = 'forge-branch-protection';
+  if (!forge || !cfg?.repos?.length) return check(id, 'WARN', '工程尚未登记可检查的 Forge 仓库');
+  if (!loggedIn) return check(id, 'WARN', 'Forge CLI 登录态不可用，服务端分支保护未核验');
+
+  const gitlab = forge === 'gitlab';
+  const bin = gitlab ? 'glab' : 'gh';
+  const hostArgs = forgeHostArgs({ hostname: host });
+  const hostname = hostArgs.length ? ` ${hostArgs[0]} ${shellWord(hostArgs[1])}` : '';
+  const read = (endpoint, include = false) => probe(bin, [
+    'api', ...hostArgs, ...(include ? ['--include'] : []), endpoint,
+  ], { cwd, env });
+  const hookFix = '可运行 node <skill>/hooks/install-hooks.mjs 加装本地 Hook';
+  const details = [];
+  const fixes = new Set();
+  for (const { repo, branch } of cfg.repos) {
+    const candidates = new Set([...(cfg.protectedEnvBranches ?? []), branch].filter((name) => name && !name.startsWith('/') && !name.includes('*')));
+    if (!candidates.size) continue;
+    const base = gitlab ? 'projects/' + encodeURIComponent(repo) : 'repos/' + repo;
+    try {
+      const remote = probeForgeNames(read, base + (gitlab ? '/repository/branches' : '/branches'));
+      const present = remote.filter((name) => candidates.has(name));
+      if (!present.length) continue;
+      const gitlabProtection = gitlab ? probeForgeNames(read, base + '/protected_branches') : null;
+      for (const name of present) {
+        const ref = repo + ':' + name;
+        if (gitlab) {
+          if (matchProtectedBranch(name, gitlabProtection)) {
+            details.push(ref + ' 已保护');
+          } else {
+            details.push(ref + ' 未保护');
+            fixes.add('glab api' + hostname + ' --method POST ' + shellWord(base + '/protected_branches') + ' --raw-field ' + shellWord('name=' + name));
+          }
+          continue;
+        }
+        const endpoint = base + '/branches/' + encodeURIComponent(name) + '/protection';
+        const result = read(endpoint, true);
+        const status = /^HTTP\/[\d.]+\s+(\d{3})\b/m.exec(result.stdout)?.[1] ?? /\(HTTP (\d{3})\)/.exec(result.stderr)?.[1];
+        const unsupported = /upgrade to github|make this repository public|plan.{0,30}not support/i.test(result.stdout + '\n' + result.stderr);
+        if (result.status === 0 && !result.error && status === '200') {
+          details.push(ref + ' 已保护');
+        } else if (status === '403' || unsupported) {
+          details.push(ref + ' 无法核验保护（' + (status === '403' ? 'HTTP 403，检查权限或仓库套餐' : '仓库套餐不支持') + '）');
+          fixes.add(hookFix);
+        } else if (status === '404') {
+          details.push(ref + ' 未查到分支保护（HTTP 404）');
+          fixes.add('配置 branch-protection.json 后执行 gh api' + hostname + ' --method PUT ' + shellWord(endpoint) + ' --input branch-protection.json');
+        } else {
+          details.push(ref + ' 分支保护读取失败（' + (result.error ?? status ?? result.status) + '）');
+          fixes.add(hookFix);
+        }
+      }
+    } catch (err) {
+      details.push(repo + '：' + err.message);
+      fixes.add(hookFix);
+    }
+  }
+  return check(id, fixes.size ? 'WARN' : 'PASS', details.join(' ｜ ') || '远端没有匹配的精确名分支', [...fixes].join('；'));
 }
 
 function runDoctor(flags = {}, configDir, opts = {}) {
@@ -299,9 +325,14 @@ function runDoctor(flags = {}, configDir, opts = {}) {
   const forgeOverride = flagText(flags, 'forge')?.toLowerCase() ?? null;
   const configuredForge = (['gitlab', 'github'].includes(forgeOverride ?? '') ? forgeOverride : null)
     ?? (cfg?.forge ? String(cfg.forge).toLowerCase() : null);
+  const configuredHost = !cfg?.forge || cfg.forge === configuredForge ? forgeHostArgs({ ...cfg, forge: configuredForge })[1] : null;
+  const protectionHost = flagText(flags, 'hostname') ?? configuredHost
+    ?? (configuredForge === 'gitlab' ? env.GITLAB_HOST : env.GH_HOST);
+  let forgeLoggedIn = false;
   if (configuredForge) {
     const bin = configuredForge === 'gitlab' ? 'glab' : 'gh';
-    const state = probeForgeCli(bin, probe, cwd);
+    const state = probeForgeCli(bin, probe, cwd, protectionHost);
+    forgeLoggedIn = state.loggedIn;
     if (!state.installed) {
       checks.push(check('forge-cli', 'BLOCK', `工程 Forge=${configuredForge}，但 ${bin} 不可用：${state.detail}`, `安装 ${bin} 后执行 ${bin} auth login`));
     } else if (!state.loggedIn) {
@@ -317,6 +348,7 @@ function runDoctor(flags = {}, configDir, opts = {}) {
       ? check('forge-cli', 'PASS', `未配置 forge，探测到可用：${usable.join(' / ')}（工程档案仍需写明 forge）`)
       : check('forge-cli', 'BLOCK', `未配置 forge，且 glab / gh 均不可用（${glab.detail}；${gh.detail}）`, '安装并登录 glab 或 gh，并在工程档案写 forge: gitlab|github'));
   }
+  checks.push(checkForgeBranchProtection(cfg, configuredForge, { probe, cwd, env, loggedIn: forgeLoggedIn, host: protectionHost }));
 
   // ④ 配置：me.yaml 与工程档案存在且能解析；未初始化只 WARN 引导冷启动。
   const meFile = findConfigFile(dir, 'me');
@@ -539,96 +571,6 @@ function runLedgerLint(flags = {}) {
   return { ok: issues.length === 0, lineCount, maxLines, issues, exitCode: issues.length ? 2 : 0 };
 }
 
-/* ------------------------------------------------------------------ */
-/* 模块 3：状态机红线                                                     */
-/* ------------------------------------------------------------------ */
-
-function transitionBlock(code, reason, requiredAction) {
-  return { ok: false, allowed: false, code, reason, requiredAction, exitCode: 2 };
-}
-
-function runTransitionCheck(flags = {}) {
-  const input = readJsonArg(flags, 'input');
-  const tier = String(input.tier ?? 'L2').toUpperCase();
-  if (!TIERS.includes(tier)) throw new CliError('INVALID_TIER', `tier 只能是 ${TIERS.join('/')}，收到：${input.tier}`);
-
-  const states = {};
-  for (const name of ['fromState', 'toState']) {
-    const value = String(input[name] ?? '').trim();
-    const parsed = parseLedgerState(value);
-    if (!parsed) {
-      throw new CliError('INVALID_STATE', `${name} 必须是 ${LEDGER_STATES.join('/')} 之一，收到：${value || '(空)'}`);
-    }
-    states[name] = parsed;
-  }
-  const { fromState: from, toState: { state: toState } } = states;
-  // mrMeta.hasUnmergedDependsOn 不在这里判：叠加依赖由 forge.mjs change-merge 与 eval-review 实查，
-  // guard 只守状态机 5 条红线，同一门禁不重复实现（否则两处口径必然漂移）。
-  const mrMeta = isPlainObject(input.mrMeta) ? input.mrMeta : {};
-  const autoMerge = input.autoMerge === true || mrMeta.autoMerge === true;
-  const rejectCount = Number(mrMeta.rejectCount ?? input.rejectCount ?? 0) || 0;
-
-  // ① 非现任主控写台账，且没有显式声明接任：串单与误覆盖的第一来源。
-  if (input.isOwner === false && input.isHandoff !== true) {
-    return transitionBlock(
-      'NOT_OWNER',
-      '当前会话不是台账现任主控，且未声明接任：禁止变更状态',
-      '先 issue-get 核对第 1 节「主控：第 N 任 ｜ <sessionId>」；非现任立即停写并自停定时任务，确需接管则显式传 isHandoff: true。',
-    );
-  }
-
-  // ② 跳过独立终审直奔待合并/已合入：漏审的唯一入口。
-  if (toState === '待合并' || toState === '已合入') {
-    const reviewed = mrMeta.hasValidReview === true && String(mrMeta.reviewVerdict ?? '').trim() === '通过';
-    const l1Escape = tier === 'L1' && input.allowSkipReview === true && !autoMerge;
-    const fusedVerdict = toState === '待合并' && rejectCount >= REJECT_FUSE
-      && mrMeta.hasValidReview === true && String(mrMeta.reviewVerdict ?? '').trim() === '打回';
-    if (!reviewed && !l1Escape && !fusedVerdict) {
-      const why = mrMeta.hasValidReview === true
-        ? `终审结论是「${mrMeta.reviewVerdict ?? '未写'}」而非「通过」`
-        : '没有独立终审的有效结论';
-      return transitionBlock(
-        'SKIP_FINAL_REVIEW',
-        `直接进入「${toState}」，但${why}`,
-        '先派独立终审并回写结论「通过」；仅 L1 可在显式 allowSkipReview: true 且人工合并时跳过。',
-      );
-    }
-  }
-
-  // ③ 打回熔断后仍试图自动合入：k≥2 一律交人裁决。
-  if (rejectCount >= REJECT_FUSE && autoMerge) {
-    return transitionBlock(
-      'REJECT_FUSE_BLOCK',
-      `同一变更单累计打回 k=${rejectCount}（≥${REJECT_FUSE}）已熔断，仍试图自动合入`,
-      '熔断后结论一律交人裁决：台账第 2 节列 [待裁决]，禁止自动合并。',
-    );
-  }
-
-  // ④ 阻断未解除就切回进行中/待终审：会带着未解阻断继续写码与送审。
-  if ((from.original ?? from.state) === '阻断' && input.blockResolved !== true && ['进行中', '待终审'].includes(toState)) {
-    return transitionBlock(
-      'BLOCK_UNRESOLVED',
-      '当前处于「阻断」，blockResolved 不为 true 却试图切回进行中/待终审',
-      '先在台账第 4 节写清阻断解除依据（或升级串裁决结论），再切回。',
-    );
-  }
-
-  // ⑤ 受保护环境分支自动合并：test/uat/main/master 一律人合。
-  if (mrMeta.targetIsProtectedEnv === true && autoMerge) {
-    return transitionBlock(
-      'PROTECTED_ENV_AUTO_MERGE',
-      '目标分支命中受保护环境分支，却试图自动合并',
-      'test/uat/main/master 等环境分支一律人工合并，AI 只停在「待合并」。',
-    );
-  }
-
-  return { ok: true, allowed: true };
-}
-
-/* ------------------------------------------------------------------ */
-/* 模块 4：个人临时约定抽查                                                */
-/* ------------------------------------------------------------------ */
-
 /** 削弱门禁的动作词：命中后还必须落在受保护对象上才算违规。 */
 const BYPASS_VERBS = /(免除?|跳过|绕开|绕过|无需|无须|不用|不必|不经过|不走|不送|省去|省略|忽略|关闭|取消|私自|自行|强制|先合|直接(合|合并|合入|推|改|写入|落盘))/;
 
@@ -714,14 +656,16 @@ function normalizeMrs(raw) {
   return asArray(raw).map((item) => {
     const state = String(item.state ?? item.status ?? '').trim();
     const labels = labelNames(item.labels);
+    const inReview = labels.includes('终审中') && !labels.includes('待终审');
+    const rejected = inReview && item.review?.state === 'rejected';
     return {
       ref: String(item.url ?? (item.repo && item.id ? `${item.repo}!${item.id}` : (item.id ?? item.key ?? 'MR'))),
       slot: item.slot ?? item.ownerSlot ?? labels.find((label) => /^槽位.+/.test(label))?.slice(2) ?? null,
-      merged: isMergedState(state),
+      open: !isMergedState(state) && !/^(closed|locked|已关闭)$/i.test(state),
       blocked: state === '阻断' || labels.includes('阻断'),
-      needsChanges: state === '需修改' || labels.includes('需修改') || String(item.reviewVerdict ?? '').trim() === '打回',
-      awaitingReview: [state, ...labels].some((label) => label === '待终审' || label === '终审中'),
-      rejectCount: Number(item.rejectCount ?? 0) || 0,
+      needsChanges: rejected || state === '需修改' || labels.includes('需修改') || String(item.reviewVerdict ?? '').trim() === '打回',
+      awaitingReview: !rejected && [state, ...labels].some((label) => label === '待终审' || label === '终审中'),
+      rejectCount: Number(item.review?.rejectCount ?? item.rejectCount ?? 0) || 0,
       stale: item.stale === true,
     };
   });
@@ -747,7 +691,7 @@ function collectSlotNames(live, mrs, issues, escalations) {
 }
 
 function slotHealthOf(slot, { mrs, issues, escalations, fuse, slotMeta }) {
-  const mine = mrs.filter((m) => m.slot === slot && !m.merged);
+  const mine = mrs.filter((m) => m.slot === slot && m.open);
   const escalationsMine = escalations.filter((e) => e.slot === slot && e.blocking && !e.resolved);
   const blockedIssues = issues.filter((i) => i.slot === slot && i.state === '阻断');
   const awaitingVerdict = issues.filter((i) => i.slot === slot && i.state === '待裁决');
@@ -775,19 +719,29 @@ function slotHealthOf(slot, { mrs, issues, escalations, fuse, slotMeta }) {
   return { slot, level, summary };
 }
 
-function buildLiveStatus(base, live, run) {
+function buildLiveStatus(base, live, run, forgeFacts) {
   const data = live ?? run;
+  const errors = forgeFacts?.errors ?? [];
+  const verified = !live && forgeFacts && !errors.length;
   const req = run?.req ?? live?.req ?? base.req ?? null;
   const tier = run?.tier ?? live?.tier ?? null;
   const stage = run?.stage ?? live?.stage ?? null;
   const fuse = Number(data?.rejectFuseCount ?? run?.thresholds?.rejectFuseCount ?? REJECT_FUSE) || REJECT_FUSE;
 
-  const issues = normalizeIssues(data?.issues);
-  const mrs = normalizeMrs(data?.mrs ?? data?.changes);
+  const issues = normalizeIssues(verified ? [...forgeFacts.ledgers, ...forgeFacts.subIssues].map((issue) => ({
+    ...issue,
+    slot: issue.key?.match(/^slot:(.+)$/)?.[1] ?? issue.labels?.find((label) => /^槽位.+/.test(label))?.slice(2),
+    state: issue.state === 'open' ? (issue.labels?.includes('阻断') ? '阻断' : ledgerField(ledgerSection(issue.body, 1), '状态') ?? 'open') : issue.state,
+  })) : data?.issues);
+  const mrs = normalizeMrs(verified ? forgeFacts.changes : data?.mrs ?? data?.changes);
   const blockers = asArray(data?.blockers)
     .filter((blocker) => !blocker.closed)
     .map((blocker) => ({ ...blocker, blocking: true }));
-  const escalations = normalizeEscalations([...asArray(data?.escalations), ...blockers]);
+  const escalationLedger = verified ? forgeFacts.ledgers.find((item) => item.key === 'escalation' && item.state === 'open') : null;
+  const master = verified ? forgeFacts.ledgers.find((item) => item.key === 'master') : null;
+  const escalations = normalizeEscalations(verified
+    ? escalationsFor(escalationLedger, master, ledgerSection).map((entry) => ({ ...entry, resolved: entry.adjudicated }))
+    : [...asArray(data?.escalations), ...blockers]);
   const slotMetas = new Map();
   for (const item of asArray(data?.slots)) {
     const name = typeof item === 'string' ? item : (item?.slot ?? item?.name ?? item?.key);
@@ -805,7 +759,7 @@ function buildLiveStatus(base, live, run) {
     if (item.state === '待裁决') push('LEDGER_AWAITING_VERDICT', 'yellow', `台账待裁决：${item.ref}`, { ref: item.ref, slot: item.slot });
   }
   for (const item of mrs) {
-    if (item.merged) continue;
+    if (!item.open) continue;
     if (item.rejectCount >= fuse) push('REJECT_FUSE', 'red', `${item.ref} 累计打回 ${item.rejectCount} 次已熔断：交人裁决`, { ref: item.ref, slot: item.slot });
     if (item.blocked) push('MR_BLOCKED', 'yellow', `${item.ref} 处于阻断`, { ref: item.ref, slot: item.slot });
     if (item.needsChanges) push('MR_NEEDS_CHANGES', 'yellow', `${item.ref} 需修改`, { ref: item.ref, slot: item.slot });
@@ -826,7 +780,7 @@ function buildLiveStatus(base, live, run) {
   const slotHealth = slotNames
     .map((slot) => slotHealthOf(slot, { mrs, issues, escalations, fuse, slotMeta: slotMetas.get(slot) }))
     .sort((a, b) => levelRank[a.level] - levelRank[b.level]);
-  const openMrs = mrs.filter((m) => !m.merged);
+  const openMrs = mrs.filter((m) => m.open);
   const totals = {
     issues: issues.length,
     mrs: mrs.length,
@@ -844,15 +798,16 @@ function buildLiveStatus(base, live, run) {
     req,
     tier,
     stage,
-    source: live ? 'live' : 'run',
+    source: verified ? 'forge' : live ? 'live' : 'run',
     totals,
     headline: [
+      errors.length ? `Forge 实时读取失败 ${errors.length} 项（${[...new Set(errors.map(({ code }) => code))].join('、')}）` : null,
       tier ?? '未配置档位',
       `阶段 ${stage ?? '未知'}`,
       `未合入 MR ${totals.openMrs}`,
       `阻断 ${totals.blockingEscalations}`,
       `待办 ${totals.actions} 项`,
-      live ? null : '（未提供 live 数据，仅基于运行态）',
+      live || verified ? null : (forgeFacts ? '（概览基于运行态，实查见 forgeFacts）' : '（未提供 live 数据，仅基于运行态）'),
     ].filter(Boolean).join(' ｜ '),
   };
 
@@ -874,10 +829,8 @@ export {
   countLedgerLines,
   ledgerSection,
   labelNames,
-  splitPatterns,
   runDoctor,
   runLedgerLint,
-  runTransitionCheck,
   checkPersonalPolicyOverride,
   buildLiveStatus,
 };

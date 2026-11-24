@@ -2,18 +2,15 @@
 /**
  * loopctl.mjs — xxn-lite-loop 配置引擎、状态判定、平滑升档与收尾拆架 CLI。
  *
- * 零依赖 Node.js ESM（Node 20+），不读写任何业务仓库，
- * 所有长期配置与临时运行态都落在 --config-dir（默认 ~/.config/dev-loop）。
+ * 零依赖 Node.js ESM（Node 20+）。长期配置与运行态落在 --config-dir（默认 ~/.config/dev-loop）。
  *
  * 子命令：
  *   config-resolve  四级配置合并（tiers.md 默认 < me < projects/<slug> < overrides）
  *   preview-init    6 行确认单 + 应建台账/定时任务/标签清单（与 init 共用 buildRunSpec）
  *   init            写入 runs/<req>.json（已存在默认拒绝，--resume 读回）
  *   upgrade         L1→L2→L3 逐级升档：默认出计划，--apply 逐项回执后落盘
- *   wake-decision   唤醒判定 + 工作时段心跳限权 + 接任首轮边界 + 写前校验
- *   eval-review     终审结论分流：k≥2 熔断、6 条风险、环境分支、head SHA、Depends-On
- *   eval-patrol     小巡检 / 大巡检判定（工作分钟计时、去重键、群 @ 护栏）
  *   slot-claim      L3 抢槽：按槽位过滤「最早未撤回绑定」胜出
+ *   brief           生成角色任务头，先 fetch 更新对应的 origin/* 基线引用
  *   teardown        两步拆架：默认出清单保留 run，--finalize 逐项核验后归档
  */
 
@@ -22,6 +19,11 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
+import { FULL_SHA, readReviews, reviewJournalPath, reviewsFor } from './lib/review-journal.mjs';
+import { hasRejectFuse, isWaitingMerge, resolveReviewState } from './lib/review-state.mjs';
+import { configPath, demandLabel, forgeHostArgs, primaryLedgerKey, latestAcceptance, acceptanceEnabled, boundLedger, issueNumber, matchingDeveloperModel, normModel, sameModel, expandHome, runFile, safeSlug, writeAtomic, factFailure, CliError, ENV_BRANCHES, splitPatterns, validateBranchPatterns, protectedMergeBaseline, isRunSidecar, withFileLock, tickLockPath, resolveTrialConfig } from './lib/common.mjs';
 import {
   TRACKING_SECTIONS,
   PERSONAL_SECTIONS,
@@ -29,20 +31,22 @@ import {
   countLedgerLines,
   ledgerSection,
   labelNames,
-  splitPatterns,
   runDoctor,
   runLedgerLint,
-  runTransitionCheck,
   checkPersonalPolicyOverride,
   buildLiveStatus,
 } from './guard.mjs';
-import { runRetro } from './retro.mjs';
+import { collectRunFacts, postTickComment, readForgeIssueOwner, readForgeIssueState, readSlotClaimFacts, readAcceptanceBaseline, parseDepRef, forgeRecordUrl, registeredDemandIssues } from './forge.mjs';
+import { patrolAlertStatus, readTickHistory, tick, tickHistoryPath } from './lib/tick.mjs';
+import { formatScriptComment } from './lib/action-messages.mjs';
+import { describeMergeMode, formatStatus, mergeModeFromMaster } from './lib/status-view.mjs';
+import { dispatchSlot, escalationsFor, issueRef } from './lib/tick-dispatch.mjs';
+import { activeSlotClaims, forgeSlotClaims, slotKey } from './lib/slot-claims.mjs';
+import { runNotification } from './lib/outbox.mjs';
+import { verifyGroup } from './lib/lark-im.mjs';
 
-const VERSION = '2.0.0';
+const VERSION = '2.2.0';
 const SKILL_NAME = 'xxn-lite-loop';
-const WORKDAY_HOURS = 8;
-const PROD_TRUNKS = ['main', 'master'];
-const ENV_BRANCHES = ['main', 'master', 'test', 'uat'];
 const DEFAULT_WORK_HOURS = { start: '09:00', end: '19:00', timezone: 'Asia/Shanghai' };
 const BASE_LABELS = ['待终审', '终审中', '待合并', '需修改', '阻断', '风险高', '风险低', 'bug'];
 const REVIEW_LABELS = ['待终审', '终审中', '待合并'];
@@ -54,11 +58,10 @@ const THRESHOLD_DEFAULTS = {
   leadPatrolMinutes: 30,
   stuckHours: 2,
   disconnectCycles: 2,
-  handoffGraceCycles: 2,
   confirmTimeoutHours: 4,
+  controllerReminderHours: 2,
   correctionTimeoutHours: 2,
   ledgerMaxLines: 80,
-  ledgerStaleWorkdays: 1,
   mrIdleWarnHours: 4,
   mrIdleEscalateHours: 8,
   p3PauseMaxHours: 8,
@@ -67,14 +70,14 @@ const THRESHOLD_DEFAULTS = {
   reviewWaitWarnHours: 24,
   blockEscalateHours: 4,
   rejectFuseCount: 2,
-  changeGranularity: '1-3',
+  trialMergeTimeoutMinutes: 15,
   externalMentionWindow: '09:00-19:00',
 };
 
 const L2_THRESHOLDS = [
-  'controllerLoopMinutes', 'smallPatrolMinutes', 'stuckHours', 'disconnectCycles', 'handoffGraceCycles',
-  'confirmTimeoutHours', 'correctionTimeoutHours', 'ledgerMaxLines', 'ledgerStaleWorkdays', 'mrIdleWarnHours',
-  'reviewStaleHours', 'reviewWaitWarnHours', 'rejectFuseCount', 'changeGranularity',
+  'controllerLoopMinutes', 'smallPatrolMinutes', 'stuckHours', 'disconnectCycles',
+  'confirmTimeoutHours', 'controllerReminderHours', 'correctionTimeoutHours', 'ledgerMaxLines', 'mrIdleWarnHours',
+  'reviewStaleHours', 'reviewWaitWarnHours', 'rejectFuseCount', 'trialMergeTimeoutMinutes',
 ];
 
 const TIER_PROFILES = {
@@ -83,7 +86,7 @@ const TIER_PROFILES = {
     ledgerMode: 'single',
     tasks: [],
     labels: ['待终审', '终审中', '待合并', '需修改', '风险高', '风险低'],
-    activeThresholds: ['reviewStaleHours', 'rejectFuseCount'],
+    activeThresholds: ['reviewStaleHours', 'rejectFuseCount', 'trialMergeTimeoutMinutes'],
     autoMerge: false,
     contracts: false,
     notifyMode: '仅会话',
@@ -105,7 +108,7 @@ const TIER_PROFILES = {
   L3: {
     label: 'L3 · 团队严格档（Squad）',
     ledgerMode: 'squad',
-    tasks: ['controller', 'patrol', 'dispatch', 'lead-patrol', 'lead-daily'],
+    tasks: ['controller', 'patrol', 'dispatch', 'lead-patrol'],
     labels: BASE_LABELS,
     activeThresholds: Object.keys(THRESHOLD_DEFAULTS),
     autoMerge: true,
@@ -122,31 +125,13 @@ const TASK_DEFS = {
   patrol: { title: '静音小巡检', every: 'smallPatrolMinutes', ledger: 'personal', entryDoc: 'references/patrol-and-notify.md' },
   dispatch: { title: '主研发调度', every: 'controllerLoopMinutes', ledger: 'master', entryDoc: 'references/review-and-dispatch.md' },
   'lead-patrol': { title: '全局大巡检', every: 'leadPatrolMinutes', ledger: 'master', entryDoc: 'references/patrol-and-notify.md' },
-  'lead-daily': { title: '每日日报', daily: true, ledger: 'master', entryDoc: 'references/patrol-and-notify.md' },
 };
-
-const RISK_RULES = [
-  { key: 'contract', label: '涉及契约字段或对外接口（含 MQ、RPC/Dubbo、OpenAPI）' },
-  { key: 'hotFile', label: '修改公共热点文件或其他槽位持有文件的已有内容（末尾声明追加不算）' },
-  { key: 'migration', label: '数据表结构或存量数据迁移变更' },
-  { key: 'switchDefault', label: '改变开关默认值，或改写开关关闭时会执行的存量逻辑' },
-  { key: 'signature', label: '修改其他槽位或关联仓会调用的接口/方法签名' },
-  { key: 'foundation', label: '地基 PR/MR 或共用构建配置（如根 pom.xml / 顶层依赖锁文件）' },
-];
 
 /* ------------------------------------------------------------------ */
 /* 基础工具                                                             */
 /* ------------------------------------------------------------------ */
 
-class CliError extends Error {
-  constructor(code, message, extra = {}) {
-    super(message);
-    this.code = code;
-    this.extra = extra;
-  }
-}
-
-const BOOLEAN_FLAGS = new Set(['force', 'help', 'plan', 'finalize', 'apply', 'resume']);
+const BOOLEAN_FLAGS = new Set(['force', 'help', 'plan', 'finalize', 'apply', 'resume', 'all', 'confirm-required', 'json', 'manual', 'auto']);
 
 function parseArgs(argv) {
   const flags = Object.create(null);
@@ -181,17 +166,6 @@ function requireFlag(flags, key) {
   const v = optFlag(flags, key);
   if (v === null) throw new CliError('MISSING_FLAG', `缺少必填参数 --${key}`);
   return v;
-}
-
-function expandHome(p) {
-  if (p === '~') return os.homedir();
-  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
-  return p;
-}
-
-function resolveConfigDir(flags) {
-  const dir = optFlag(flags, 'config-dir') ?? process.env.XXN_LITE_LOOP_CONFIG_DIR ?? path.join(os.homedir(), '.config', 'dev-loop');
-  return path.resolve(expandHome(dir));
 }
 
 function isPlainObject(v) {
@@ -235,11 +209,6 @@ function shortHash(text) {
   return crypto.createHash('sha256').update(String(text)).digest('hex').slice(0, 8);
 }
 
-function safeSlug(value) {
-  const s = String(value ?? '').trim().replace(/[\\/:*?"<>|\s]+/g, '-').replace(/\.{2,}/g, '.');
-  return s.replace(/^[.-]+|[.-]+$/g, '') || 'req';
-}
-
 /** 定时任务 ID 片段：纯 ASCII 原样保留；含非 ASCII 时附稳定 SHA-256 短后缀，杜绝撞名。 */
 function taskSafe(value) {
   const text = String(value ?? '').trim();
@@ -262,17 +231,10 @@ function readJson(file, code = 'JSON_NOT_FOUND') {
   }
 }
 
-/** 同目录临时文件保证读取者只会看到完整 JSON；首次创建用硬链接原子判重。 */
-function writeJson(file, payload, { create = false } = {}) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp.${process.pid}`;
-  try {
-    fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-    if (create) fs.linkSync(tmp, file);
-    else fs.renameSync(tmp, file);
-  } finally {
-    fs.rmSync(tmp, { force: true });
-  }
+/** 同目录临时文件保证读取者只会看到完整配置；首次创建用硬链接原子判重。 */
+function writeJson(file, payload, options) {
+  const stored = payload.autoMerge === true && protectedMergeBaseline(payload) ? { ...payload, autoMerge: false } : payload;
+  writeAtomic(file, `${JSON.stringify(stored, null, 2)}\n`, options);
 }
 
 function parseJsonArg(value, flagName) {
@@ -283,10 +245,6 @@ function parseJsonArg(value, flagName) {
   } catch (err) {
     throw new CliError('INVALID_JSON', `--${flagName} 不是合法 JSON：${err.message}`);
   }
-}
-
-function runFile(configDir, req) {
-  return path.join(configDir, 'runs', `${safeSlug(req)}.json`);
 }
 
 /* ------------------------------------------------------------------ */
@@ -303,7 +261,8 @@ function scan(text, onChar) {
   for (let i = 0; i < text.length; i += 1) {
     const c = text[i];
     if (quote) {
-      if (c === quote) quote = null;
+      if (quote === '"' && c === '\\') i += 1;
+      else if (c === quote) quote = null;
       continue;
     }
     if (c === '"' || c === "'") {
@@ -476,9 +435,39 @@ function findConfigFile(baseDir, slug) {
   return null;
 }
 
-/* ------------------------------------------------------------------ */
-/* 时区、时间窗与工作分钟（wake-decision 与 eval-patrol 共用）              */
-/* ------------------------------------------------------------------ */
+function yamlFlow(value) {
+  if (Array.isArray(value)) return `[${value.map(yamlFlow).join(', ')}]`;
+  if (isPlainObject(value)) return `{${Object.entries(value).map(([key, val]) => `${JSON.stringify(key)}: ${yamlFlow(val)}`).join(', ')}}`;
+  return JSON.stringify(value);
+}
+
+function projectNotifyText(file, desired) {
+  if (file.toLowerCase().endsWith('.json')) return `${JSON.stringify(desired, null, 2)}\n`;
+  const original = fs.readFileSync(file, 'utf8');
+  const newline = original.includes('\r\n') ? '\r\n' : '\n';
+  const lines = original.split(/\r?\n/);
+  const fields = lines.flatMap((line, index) => {
+    const body = stripComment(line);
+    return body.trim() ? [{ index, indent: body.match(/^ */)[0].length, key: splitKey(body.trim())?.[0] }] : [];
+  });
+  const indent = fields[0]?.indent ?? 0;
+  const at = fields.findIndex((field) => field.indent === indent && field.key && unquote(field.key, field.index + 1) === 'notify');
+  const block = [
+    `${' '.repeat(indent)}notify:`,
+    ...Object.entries(desired.notify).map(([key, value]) => `${' '.repeat(indent + 2)}${JSON.stringify(key)}: ${yamlFlow(value)}`),
+  ];
+  if (at < 0) {
+    if (lines.at(-1) === '') lines.pop();
+    lines.push(...block, '');
+  } else {
+    const last = fields.slice(at + 1).findIndex((field) => field.indent === indent);
+    const tail = last < 0 ? fields.at(-1).index : fields[at + last].index;
+    lines.splice(fields[at].index, tail - fields[at].index + 1, ...block);
+  }
+  const next = lines.join(newline);
+  if (!isDeepStrictEqual(parseYaml(next), desired)) throw new CliError('INVALID_NOTIFY_CONFIG', '更新群配置后工程档案无法按原结构读回');
+  return next;
+}
 
 const zoneFormatters = new Map();
 
@@ -578,6 +567,24 @@ function workHoursBetween(fromMs, toMs, win) {
   return total / 3600000;
 }
 
+function addWorkingHours(nowMs, hours, win) {
+  let cursor = nowMs;
+  let remaining = hours * 3_600_000;
+  for (let windowCount = 0; remaining > 0 && windowCount < 20_000; windowCount += 1) {
+    const minutes = localMinutes(cursor, win.timezone);
+    const boundary = Math.max(1, Math.round(minutesToBoundary(minutes, win) * 60_000));
+    if (insideWindow(minutes, win)) {
+      const step = Math.min(remaining, boundary);
+      cursor += step;
+      remaining -= step;
+    } else {
+      cursor += boundary;
+    }
+  }
+  if (remaining > 0) throw new CliError('INVALID_CONFIG', '工作时段无法累计通知有效期');
+  return cursor;
+}
+
 function windowAt(nowMs, win) {
   const minutes = localMinutes(nowMs, win.timezone);
   const inside = insideWindow(minutes, win);
@@ -597,6 +604,14 @@ function workWindow(input, fallback = DEFAULT_WORK_HOURS) {
   if (input.timezone) win.timezone = String(input.timezone);
   validateTimezone(win.timezone);
   return win;
+}
+
+function mentionWindow(input, win = workWindow(input)) {
+  const mentionWin = { timezone: win.timezone, ...parseWindow(THRESHOLD_DEFAULTS.externalMentionWindow),
+    ...parseWindow(input.thresholds?.externalMentionWindow ?? input.notify?.externalMentionWindow), ...parseWindow(input.mentionWindow) };
+  if (input.timezone) mentionWin.timezone = String(input.timezone);
+  validateTimezone(mentionWin.timezone);
+  return mentionWin;
 }
 
 /* ------------------------------------------------------------------ */
@@ -653,43 +668,6 @@ function normalizeSlots(value) {
   const slots = [...new Set(list(value).map((s) => s.replace(/^槽位/, '')))];
   if (!slots.includes('主研发')) slots.unshift('主研发');
   return slots;
-}
-
-function compileBranchPattern(pattern) {
-  const raw = String(pattern ?? '').trim();
-  if (!raw) throw new CliError('INVALID_BRANCH_PATTERN', '受保护分支规则不能为空');
-  if (raw.startsWith('/')) {
-    const m = /^\/(.+)\/([a-z]*)$/.exec(raw);
-    if (!m || /[^i]/.test(m[2])) {
-      throw new CliError('INVALID_BRANCH_PATTERN', `非法正则分支规则（仅支持 /pattern/ 或 /pattern/i）：${raw}`, { pattern: raw });
-    }
-    try {
-      const re = new RegExp(m[1], m[2]);
-      return (branch) => re.test(branch);
-    } catch (err) {
-      throw new CliError('INVALID_BRANCH_PATTERN', `正则分支规则编译失败（${raw}）：${err.message}`, { pattern: raw });
-    }
-  }
-  if (raw.includes('*')) {
-    const escaped = raw.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-    const re = new RegExp(`^${escaped}$`);
-    return (branch) => re.test(branch);
-  }
-  return (branch) => branch === raw;
-}
-
-function validateBranchPatterns(patterns) {
-  for (const pat of patterns) compileBranchPattern(pat);
-  return patterns;
-}
-
-function matchesBranchPattern(branch, patterns) {
-  const name = String(branch ?? '').trim();
-  if (!name) return false;
-  for (const pat of patterns) {
-    if (compileBranchPattern(pat)(name)) return true;
-  }
-  return false;
 }
 
 function resolveGitBaselineStartSha(repoPath, baselineBranch, trunkBranch) {
@@ -825,7 +803,14 @@ function resolveConfig({ configDir, project, tier, overrides }) {
   hm(thresholds.externalMentionWindow.start);
   hm(thresholds.externalMentionWindow.end);
 
-  const commands = m.verification?.commands ?? {};
+  const commands = isPlainObject(m.verification?.commands) ? m.verification.commands : {};
+  const { mode, skipReason } = resolveTrialConfig(m.verification);
+  const verification = {
+    ...(isPlainObject(m.verification) ? m.verification : {}),
+    mode,
+    commands,
+    skipReason,
+  };
   const linked = Array.isArray(m.linkedRepos) ? m.linkedRepos : [];
   const repos = [normalizeRepo(m.hubRepo, 'hub'), ...linked.map((r, idx) => normalizeRepo(r, `repo-${idx + 1}`))]
     .filter(Boolean)
@@ -833,7 +818,7 @@ function resolveConfig({ configDir, project, tier, overrides }) {
       ...r,
       branch: r.branch ?? 'main',
       role: idx === 0 ? 'hub' : 'linked',
-      verificationCommand: commands[r.name] ?? commands[r.repo] ?? null,
+      verificationCommand: resolveTrialConfig(verification, r).command,
     }));
   const notify = {
     ...(m.notify ?? {}),
@@ -842,10 +827,19 @@ function resolveConfig({ configDir, project, tier, overrides }) {
     externalNotifyDisabled: bool(m.notify?.externalNotifyDisabled, false),
     ...(isPlainObject(m.notify?.externalContacts) ? { externalContacts: m.notify.externalContacts } : {}),
   };
+  const groupLayer = layers.findLastIndex((layer) => Object.hasOwn(layer.notify ?? {}, 'feishuGroupChatId'));
+  if (groupLayer >= 0 && Object.hasOwn(layers[groupLayer].notify, 'memberOpenIds')) {
+    notify.memberOpenIds = Object.fromEntries(layers.slice(groupLayer).flatMap((layer) => Object.entries(layer.notify?.memberOpenIds ?? {})));
+  }
   hm(notify.dailyReportTime);
   const warnings = [];
   if (project && !projectFile) warnings.push(`工程组档案不存在：projects/${project}.yaml|yml|json（按首次工程处理）`);
   const rules = collectRules({ me, proj, over, tier: chosen, warnings });
+  const rawAcceptance = isPlainObject(m.acceptance) ? m.acceptance : {};
+  const acceptance = {
+    enabled: chosen !== 'L1' && bool(rawAcceptance.enabled, false),
+    guide: rawAcceptance.guide == null || String(rawAcceptance.guide).trim() === '' ? null : String(rawAcceptance.guide).trim(),
+  };
 
   return {
     configDir,
@@ -855,6 +849,7 @@ function resolveConfig({ configDir, project, tier, overrides }) {
     tier: chosen,
     tierLabel: profile.label,
     forge: m.forge ? normalizeForge(m.forge) : null,
+    hostname: m.hostname ?? null,
     gitlabHost: m.gitlabHost ?? m.hostname ?? null,
     hubRepo: repos[0] ?? null,
     linkedRepos: repos.slice(1),
@@ -866,7 +861,8 @@ function resolveConfig({ configDir, project, tier, overrides }) {
     defaultTier: proj.defaultTier || me.defaultTier || chosen,
     stage: m.stage || profile.defaultStage,
     allowedStages: profile.allowedStages,
-    verification: m.verification ?? { mode: 'local-test', commands: {} },
+    verification,
+    acceptance,
     workHours,
     roleModels: m.roleModels ?? {},
     selfReview: bool(m.selfReview, true),
@@ -914,6 +910,13 @@ function normalizeIssueMap(raw) {
   return out;
 }
 
+function missingVerificationRepos(spec) {
+  return spec.repos.filter((repo) => {
+    const { mode, command, skipReason } = resolveTrialConfig(spec.verification, repo);
+    return mode === 'local-test' && !command && !skipReason;
+  });
+}
+
 /** preview-init 与 init 共用：确认单展示的对象即落盘执行的对象。 */
 function buildRunSpec(flags, configDir) {
   const req = requireFlag(flags, 'req');
@@ -922,6 +925,11 @@ function buildRunSpec(flags, configDir) {
   const explicitBranch = optFlag(flags, 'branch');
   const templatedBranch = cfg.branchTemplate ? cfg.branchTemplate.replaceAll('{slug}', req) : null;
   const branch = explicitBranch ?? templatedBranch ?? cfg.baselineBranch ?? `loop/${safeSlug(req)}`;
+  const slots = cfg.tier === 'L3' ? normalizeSlots(optFlag(flags, 'slots') ?? cfg.slots) : ['主研发'];
+  const slot = flags.slot === undefined ? '主研发' : slotKey(requireFlag(flags, 'slot'));
+  if (flags.slot !== undefined && (cfg.tier !== 'L3' || !slots.includes(slot))) {
+    throw new CliError('INVALID_SLOT', '--slot 必须是本次 L3 已登记槽位', { slots });
+  }
   const spec = {
     req,
     project,
@@ -929,6 +937,7 @@ function buildRunSpec(flags, configDir) {
     stage: validateStage(cfg, optFlag(flags, 'stage')),
     forge: cfg.forge,
     gitlabHost: cfg.gitlabHost,
+    hostname: cfg.hostname,
     branch,
     baselineBranch: branch,
     protectedEnvBranches: cfg.protectedEnvBranches,
@@ -936,9 +945,11 @@ function buildRunSpec(flags, configDir) {
     autoMergeConfigured: cfg.autoMergeConfigured,
     hubRepo: cfg.hubRepo,
     repos: selectRepos(cfg.repos, flags.repos),
-    slots: cfg.tier === 'L3' ? normalizeSlots(optFlag(flags, 'slots') ?? cfg.slots) : ['主研发'],
+    slots,
+    ...(cfg.tier === 'L3' ? { slot } : {}),
     user: cfg.user,
     verification: cfg.verification,
+    acceptance: cfg.acceptance,
     thresholds: cfg.thresholds,
     workHours: cfg.workHours,
     notify: cfg.notify,
@@ -950,7 +961,21 @@ function buildRunSpec(flags, configDir) {
   };
   const warnings = [...cfg.warnings];
   if (!spec.forge) warnings.push('工程档案未配置 forge：init 将拒绝执行');
-  if (matchesBranchPattern(branch, spec.protectedEnvBranches)) warnings.push(`基线 ${branch} 是环境分支：自动合并会被硬拒绝，全部人工合并`);
+  const unverified = missingVerificationRepos(spec);
+  if (unverified.length) {
+    warnings.push(`未配置合并前试合命令的仓库：${unverified.map((r) => r.name ?? r.repo).join('、')}（需补 verification.commands 或写明 verification.skipReason，否则 init 将拒绝执行）`);
+  }
+  if (protectedMergeBaseline(spec)) {
+    spec.autoMerge = false;
+    warnings.push(`基线 ${branch} 是受保护分支，全部人工合并`);
+  } else if (spec.autoMerge && spec.tier === 'L1' && spec.forge) {
+    try {
+      assertL1AutoMerge(spec);
+    } catch (error) {
+      spec.autoMerge = false;
+      warnings.push(error.message);
+    }
+  }
   return { spec, cfg, warnings };
 }
 
@@ -958,57 +983,69 @@ function buildRunSpec(flags, configDir) {
 /* 台账、标签、定时任务与确认单                                            */
 /* ------------------------------------------------------------------ */
 
-function labelsFor(tier, slots) {
-  const labels = [...TIER_PROFILES[tier].labels];
+function labelsFor(tier, slots, req) {
+  const labels = [...TIER_PROFILES[tier].labels, demandLabel(req)];
   return tier === 'L3' ? [...labels, ...normalizeSlots(slots).map((s) => `槽位${s}`)] : labels;
 }
 
 function labelsSyncArgs(run) {
-  const args = ['labels-sync', '--forge', String(run.forge), '--repos', run.repos.map((r) => r.repo).join(','), '--labels', labelsFor(run.tier, run.slots).join(',')];
-  if (run.forge === 'gitlab' && run.gitlabHost) args.push('--hostname', run.gitlabHost);
-  return args;
+  const repos = [...new Set([...(run.repos ?? []).map((r) => r.repo), run.hubRepo?.repo].filter(Boolean))];
+  const args = ['labels-sync', '--forge', String(run.forge), '--repos', repos.join(','), '--req', run.req,
+    '--labels', labelsFor(run.tier, run.slots, run.req).join(',')];
+  return [...args, ...forgeHostArgs(run)];
 }
 
 /** L3 只建总台账 + 主研发本人小台账 + 升级 Issue；协作者加入时自建本人小台账。 */
-function ledgerDescriptors(tier, req, user) {
+function ledgerDescriptors({ tier, req, user, slot = '主研发' }) {
   if (tier === 'L1') return [{ key: 'tracking', kind: 'tracking', title: `【Loop】${req}` }];
   if (tier === 'L2') return [{ key: 'main', kind: 'main', title: `【台账】${req}` }];
+  const personal = { key: `slot:${slot}`, kind: 'slot', slot, title: `【小台账】${slot}-${user}` };
+  if (slot !== '主研发') return [personal];
   return [
     { key: 'master', kind: 'master', title: `【总台账】${req}` },
-    { key: 'slot:主研发', kind: 'slot', slot: '主研发', title: `【小台账】主研发-${user}` },
+    personal,
     { key: 'escalation', kind: 'escalation', title: `【升级】${req}` },
   ];
 }
 
-function personalLedgerKey(tier) {
-  return { L1: 'tracking', L2: 'main', L3: 'slot:主研发' }[tier];
+function personalLedgerKey(tier, slot = '主研发') {
+  return { L1: 'tracking', L2: 'main', L3: `slot:${slot}` }[tier];
 }
 
-function scheduledTasksFor(run) {
-  return TIER_PROFILES[run.tier].tasks
-    .filter((role) => role !== 'lead-daily' || run.notify?.dailyReportEnabled === true)
-    .map((role) => {
-      const def = TASK_DEFS[role];
-      const ledgerKey = def.ledger === 'master' ? 'master' : personalLedgerKey(run.tier);
-      const ledgerRef = run.issues?.[ledgerKey]?.id ?? '待建';
-      const id = `liteloop-${taskSafe(run.req)}-${taskSafe(run.user)}-${role}`;
-      const task = {
-        id,
-        name: id,
-        role,
-        title: def.title,
-        enabled: true,
-        schedule: def.daily ? 'daily' : 'interval',
-        ledgerKey,
-        ledgerRef,
-        skill: SKILL_NAME,
-        entryDoc: def.entryDoc,
-        description: `使用 $${SKILL_NAME}（必读 ${def.entryDoc}）；${def.title}入口：需求=${run.req}；仓库=${run.hubRepo?.repo ?? 'unknown'}；台账=${ledgerRef}；阶段、当前任务与版本以台账为准，个人配置以本机与台账配置为准。`,
-      };
-      if (def.daily) task.at = run.notify.dailyReportTime;
-      else task.everyMinutes = num(run.thresholds[def.every], THRESHOLD_DEFAULTS[def.every]);
-      return task;
-    });
+function shellArg(value) {
+  return /^[\w./-]+$/.test(value) ? value : "'" + String(value).replaceAll("'", "'\\''") + "'";
+}
+
+function scheduledTasksFor(run, configDir) {
+  const command = ['node', shellArg(fileURLToPath(import.meta.url))];
+  const scope = ['--req', shellArg(run.req), '--config-dir', shellArg(configDir)];
+  const slot = dispatchSlot(run);
+  const roles = run.tier === 'L3' && slot !== '主研发' ? ['controller', 'patrol'] : TIER_PROFILES[run.tier].tasks;
+  return roles.map((role) => {
+    const def = TASK_DEFS[role];
+    const ledgerKey = def.ledger === 'master' ? 'master' : personalLedgerKey(run.tier, slot);
+    const bound = run.issues?.[ledgerKey];
+    const ledgerRef = bound?.id ?? bound ?? '待建';
+    const id = `liteloop-${taskSafe(run.req)}-${taskSafe(run.user)}-${role}`;
+    const session = role === 'controller' ? ['--session', shellArg(run.controller?.sessionId ?? '<会话标识>')] : [];
+    const wake = [...command, 'tick', '--req', shellArg(run.req), '--role', role, '--apply', '--config-dir', shellArg(configDir), ...session].join(' ');
+    const answersUser = role === 'patrol' || role === 'lead-patrol' || (role === 'controller' && run.tier === 'L1');
+    const answer = answersUser ? ` 回答进度前运行 \`${[...command, 'status', ...scope, '--live', '--json'].join(' ')}\`。` : '';
+    return {
+      id,
+      name: id,
+      role,
+      title: def.title,
+      enabled: true,
+      schedule: 'interval',
+      everyMinutes: num(run.thresholds?.[def.every], THRESHOLD_DEFAULTS[def.every]),
+      ledgerKey,
+      ledgerRef,
+      skill: SKILL_NAME,
+      entryDoc: def.entryDoc,
+      description: `先跑 \`${wake}\`，无输出即结束本轮。使用 $${SKILL_NAME}（必读 ${def.entryDoc}）；${def.title}入口：需求=${run.req}；仓库=${run.hubRepo?.repo ?? 'unknown'}；台账=${ledgerRef}；阶段、当前任务与版本以台账为准，个人配置以本机与台账配置为准。${answer}`,
+    };
+  });
 }
 
 function changeRef(c) {
@@ -1059,6 +1096,8 @@ function renderLedgerBody(kind, run, issue) {
   }
 
   if (kind === 'main' || kind === 'slot') {
+    const confirmationPoints = run.rules?.effective?.filter((rule) => run.rules.personal?.includes(rule)
+      && /^(?:提交|送审)前(?:本人)?先看[。！.!]?$/.test(rule)).join('、') || '无';
     return [
       `## 1. ${PERSONAL_SECTIONS[0]}（当前状态）`,
       `档位：${run.tier} ｜ 阶段：${stage} ｜ 当前 Issue：未绑定 ｜ 状态：未开始 ｜ 基于契约：${run.contractVersion ?? 'v1'}（待冻结）`,
@@ -1080,8 +1119,8 @@ function renderLedgerBody(kind, run, issue) {
       '无',
       '',
       `## 5. ${PERSONAL_SECTIONS[4]}与规则引用（个人配置）`,
-      `模型：主控 ${model('controller')} / 拆分 ${model('planner')} / 开发 ${model('coder')} / 自审 ${model('selfReviewer')} / 小巡检 ${model('patrol')}`,
-      `自审：${run.selfReview === false ? '否' : '是'} ｜ 可选确认点：提交前本人先看、送审前先看 ｜ 巡检频率：${run.thresholds.smallPatrolMinutes}m ｜ 工作时段：${run.workHours.start}-${run.workHours.end}（${run.workHours.timezone}） ｜ 汇报方式：四项汇报`,
+      `模型：主控 ${model('controller')} / 拆分 ${model('planner')} / 开发 ${model('coder')} / 自审 ${model('selfReviewer')} / 终审 ${model('finalReviewer')} / 验收 ${model('acceptor')} / 小巡检 ${model('patrol')}`,
+      `自审：${run.selfReview === false ? '否' : '是'} ｜ 可选确认点：${confirmationPoints} ｜ 巡检频率：${run.thresholds.smallPatrolMinutes}m ｜ 工作时段：${run.workHours.start}-${run.workHours.end}（${run.workHours.timezone}） ｜ 汇报方式：进度、待办、最近唤醒各一句并附链接`,
       '',
     ].join('\n');
   }
@@ -1096,6 +1135,7 @@ function renderLedgerBody(kind, run, issue) {
     return [
       '## 1. 整体状态',
       `当前阶段：${stage} ｜ 下一节点：${stage === 'P0' ? 'P1 方案设计（五项汇总确认后）' : '按阶段节点推进'}`,
+      `合并方式：${describeMergeMode(run)}`,
       `整体进度：Issue 已完成 ${run.completedIssues ?? 0}/${run.totalIssues ?? 0} ｜ PR/MR 已合入 ${merged.length}/${changes.length}`,
       `已合入变更单：${merged.length ? merged.join('、') : '无'}`,
       '整体风险：无',
@@ -1138,7 +1178,7 @@ function renderLedgerBody(kind, run, issue) {
 }
 
 function buildLedgers(run) {
-  return ledgerDescriptors(run.tier, run.req, run.user).map((d) => {
+  return ledgerDescriptors(run).map((d) => {
     const issue = run.issues?.[d.key] ?? null;
     return { ...d, issue, body: renderLedgerBody(d.kind, run, issue) };
   });
@@ -1148,7 +1188,7 @@ function timerSummary(run) {
   const t = run.thresholds;
   if (run.tier === 'L1') return '关';
   const base = `主控${t.controllerLoopMinutes}m+静音巡检${t.smallPatrolMinutes}m`;
-  if (run.tier === 'L2') return base;
+  if (run.tier === 'L2' || (run.slot && run.slot !== '主研发')) return base;
   return `${base}+调度${t.controllerLoopMinutes}m+大巡检${t.leadPatrolMinutes}m${run.notify.dailyReportEnabled ? `+日报${run.notify.dailyReportTime}` : ''}`;
 }
 
@@ -1161,37 +1201,48 @@ function ruleSummaryLine(rules) {
   return `协作规矩：生效 ${effective.length} 条（个人 ${personal} / 工程 ${rules?.project?.length ?? 0} / 临时 ${rules?.temp?.length ?? 0}）`;
 }
 
+function trialStrategySummary(run) {
+  const { mode, skipReason } = resolveTrialConfig(run.verification);
+  const skip = `不试合（原因：${skipReason ?? (mode === 'local-test' ? '未配置验证命令' : `mode=${mode}`)}）`;
+  const commands = run.repos.map((repo) => ({ repo, command: resolveTrialConfig(run.verification, repo).command }));
+  if (mode !== 'local-test' || !commands.some(({ command }) => command)) return skip;
+  return commands.map(({ repo, command }) => `${repo.name ?? repo.repo}=${command ?? skip}`).join('；');
+}
+
 function confirmLines(run) {
   const models = run.roleModels ?? {};
   const model = (key) => models[key] ?? '未配置';
-  const commands = Object.entries(run.verification?.commands ?? {}).map(([k, v]) => `${k}=${v}`).join('；') || '按仓库实际命令';
+  const mode = run.verification?.mode ?? 'local-test';
+  const trialSummary = trialStrategySummary(run);
   const win = run.thresholds.externalMentionWindow;
   const notify = run.notify?.feishuGroupChatId ? `群ID(${run.notify.feishuGroupChatId})(限${win.start}-${win.end}@)` : '仅会话';
   const linked = run.repos.filter((r) => r.repo !== run.hubRepo?.repo).map((r) => r.repo);
-  let merge = '全部人工合并';
-  if (matchesBranchPattern(run.baselineBranch, run.protectedEnvBranches)) merge = '全人工合并（基线命中受保护环境分支，硬禁自动合并）';
-  else if (run.autoMerge) merge = `低风险自动合并（${run.protectedEnvBranches.join('/')} 一律人工）`;
+  const mergeRestriction = protectedMergeBaseline(run) ? '（基线是受保护分支）' : '';
+  const acceptorPart = run.tier !== 'L1' && (run.acceptance?.enabled || models.acceptor) ? ` ｜ 验收=${model('acceptor')}` : '';
+  const acceptancePart = run.tier === 'L1' ? ''
+    : run.acceptance?.enabled ? ` ｜ 出口验收：开启（说明：${run.acceptance.guide ?? '未配置'}）`
+    : ' ｜ 出口验收：关闭';
   const lines = [
     `1. 需求与档位：${run.req} ｜ 档位：${run.tier} ｜ 起跳阶段：${run.stage}`,
     `2. 工程组与基线：Forge=${run.forge ?? '未配置'}${run.gitlabHost ? `@${run.gitlabHost}` : ''} ｜ 核心仓=${run.hubRepo?.repo ?? '未配置'} ｜ 关联仓=${linked.length ? linked.join(',') : '无'} ｜ 基线=${run.branch}`,
-    `3. 验证策略：mode=${run.verification?.mode ?? 'local-test'} ｜ 命令=${commands}`,
-    `4. 角色模型：主控=${model('controller')} ｜ 开发=${model('coder')} ｜ 自审=${run.selfReview === false ? '关' : model('selfReviewer')} ｜ 终审=${model('finalReviewer')} ｜ 巡检=${run.tier === 'L1' ? '关' : model('patrol')}`,
-    `5. 节奏与确认点：定时=${timerSummary(run)} ｜ 工作时段=${run.workHours.start}-${run.workHours.end}（${run.workHours.timezone}） ｜ 合并=${merge} ｜ 通知=${notify}`,
-    '6. 收尾约定：业务仓库零规范残留；合入后执行 teardown 两步拆架（先出清单保留运行态，逐项回执后才归档）。',
+    `3. 验证策略：mode=${mode} ｜ 合并前试合=${trialSummary}`,
+    `4. 角色模型：主控=${model('controller')} ｜ 开发=${model('coder')} ｜ 开发升档=${model('coderEscalation')} ｜ 自审=${run.selfReview === false ? '关' : model('selfReviewer')} ｜ 终审=${model('finalReviewer')}${acceptorPart} ｜ 巡检=${run.tier === 'L1' ? '关' : model('patrol')}`,
+    `5. 节奏与收尾：定时=${timerSummary(run)} ｜ 工作时段=${run.workHours.start}-${run.workHours.end}（${run.workHours.timezone}） ｜ 通知=${notify}${acceptancePart} ｜ 合入后执行 teardown 两步拆架，逐项清理后归档，业务仓库零规范残留。`,
+    `6. 合并方式：${describeMergeMode(run)}${mergeRestriction}`,
   ];
   const summary = ruleSummaryLine(run.rules);
   if (summary) lines.push(summary);
   return lines;
 }
 
-function planFor(run) {
+function planFor(run, configDir) {
   const confirmSheet = confirmLines(run);
   return {
     confirmSheet,
     text: ['【xxn-lite-loop 初始化确认单】', ...confirmSheet, '请回复「确认」启动，或直接指出要改的一项。'].join('\n'),
-    ledgers: ledgerDescriptors(run.tier, run.req, run.user),
-    scheduledTasks: scheduledTasksFor(run),
-    labels: labelsFor(run.tier, run.slots),
+    ledgers: ledgerDescriptors(run),
+    scheduledTasks: scheduledTasksFor(run, configDir),
+    labels: labelsFor(run.tier, run.slots, run.req),
     labelsSync: { script: 'forge.mjs', args: labelsSyncArgs(run) },
   };
 }
@@ -1216,9 +1267,28 @@ function cmdConfigResolve(flags, configDir) {
   };
 }
 
+function modelVendor(model) {
+  const name = String(model ?? '').trim().toLowerCase();
+  const vendors = [
+    ['OpenAI', /(?:^|[\s/:])(?:openai|codex|gpt-[\d]|o[134](?:\b|[-.]))/],
+    ['Anthropic', /(?:^|[\s/:])(?:anthropic|claude)(?:[-/:\s]|$)/],
+    ['Google', /(?:^|[\s/:])(?:google|gemini)(?:[-/:\s]|$)/],
+    ['DeepSeek', /(?:^|[\s/:])deepseek(?:[-/:\s]|$)/],
+    ['xAI', /(?:^|[\s/:])(?:xai|grok)(?:[-/:\s]|$)/],
+    ['Alibaba', /(?:^|[\s/:])(?:alibaba|qwen)(?:[-/:\s]|\d|$)/],
+  ];
+  return vendors.find(([, pattern]) => pattern.test(name))?.[0] ?? null;
+}
+
 function cmdPreviewInit(flags, configDir) {
   const { spec, cfg, warnings } = buildRunSpec(flags, configDir);
-  const plan = planFor(spec);
+  const plan = planFor({ ...spec, controller: { sessionId: optFlag(flags, 'session') } }, configDir);
+  const vendor = modelVendor(spec.roleModels.controller);
+  const roles = spec.tier === 'L3' ? [['小巡检', spec.roleModels.patrol], ['大巡检', spec.roleModels.leadPatrol]]
+    : spec.tier === 'L2' ? [['小巡检', spec.roleModels.patrol]] : [];
+  for (const [role, model] of roles) {
+    if (vendor && modelVendor(model) === vendor) warnings.push(`${role}与主控模型同为 ${vendor}，请留意交叉判断覆盖。`);
+  }
   return {
     ok: true,
     req: spec.req,
@@ -1231,7 +1301,8 @@ function cmdPreviewInit(flags, configDir) {
     hubRepo: spec.hubRepo,
     repos: spec.repos,
     slots: spec.slots,
-    autoMerge: spec.autoMerge,
+    ...(spec.slot ? { slot: spec.slot } : {}),    autoMerge: spec.autoMerge,
+    acceptance: spec.acceptance,
     protectedEnvBranches: spec.protectedEnvBranches,
     confirmSheet: plan.confirmSheet,
     text: plan.text,
@@ -1240,17 +1311,97 @@ function cmdPreviewInit(flags, configDir) {
   };
 }
 
+function initForgePlan(run, labelsSync = { script: 'forge.mjs', args: labelsSyncArgs(run) }) {
+  return {
+    issueCreates: (run.ledgers ?? []).filter((ledger) => !ledger.issue)
+      .map(({ key, title, body }) => ({
+        key, title, body, labels: key.startsWith('slot:') ? [`槽位${key.slice(5)}`] : [],
+      })),
+    labelsSync,
+    scheduledTasks: run.scheduledTasks,
+  };
+}
+
+function bindInitIssues(run, raw) {
+  const supplied = normalizeIssueMap(raw);
+  if (!isPlainObject(raw) || Object.keys(raw).length !== Object.keys(supplied).length) {
+    throw new CliError('INVALID_ISSUE_MAP', '--issue-map 必须是台账键到 Issue 编号或 {id,url} 的映射');
+  }
+  const issues = { ...run.issues };
+  const ledgers = run.ledgers ?? [];
+  for (const [key, issue] of Object.entries(supplied)) {
+    const id = issueNumber(issue.id);
+    if (!id) throw new CliError('INVALID_ISSUE_MAP', `台账 ${key} 缺少有效的 Issue 编号`);
+    const existing = issues[key] ?? ledgers.find((ledger) => ledger.key === key)?.issue;
+    const existingId = existing?.id ?? existing;
+    if (existingId != null && issueNumber(existingId) !== id) {
+      throw new CliError('ISSUE_ALREADY_BOUND', `台账 ${key} 已绑定 ${existingId}，无法回填 ${issue.id}`);
+    }
+    issues[key] = { ...issue, id: existingId ?? issue.id, url: existing?.url ?? issue.url };
+  }
+  return {
+    ...run,
+    issues,
+    ledgers: ledgers.map((ledger) => ({ ...ledger, issue: issues[ledger.key] ?? ledger.issue })),
+    scheduledTasks: (run.scheduledTasks ?? []).map((task) => {
+      const ledgerRef = issues[task.ledgerKey]?.id;
+      if (!ledgerRef || ledgerRef === task.ledgerRef) return task;
+      return {
+        ...task,
+        ledgerRef,
+        description: task.description?.replace(`；台账=${task.ledgerRef}；`, () => `；台账=${ledgerRef}；`),
+      };
+    }),
+  };
+}
+
 function cmdInit(flags, configDir) {
   const req = requireFlag(flags, 'req');
   const file = runFile(configDir, req);
-  const alreadyExists = () => new CliError('RUN_ALREADY_EXISTS', `需求 ${req} 已有运行态：传 --resume 读回既有记录，绝不覆盖台账绑定与历史`, { runPath: file });
-  const resume = () => ({ ok: true, resumed: true, req, runPath: file, run: readJson(file) });
+  const session = flags.session === undefined ? null : requireFlag(flags, 'session');
+  const alreadyExists = () => new CliError('RUN_ALREADY_EXISTS', `需求 ${req} 已有运行态：传 --resume 读回既有记录或回填未绑定台账`, { runPath: file });
+  const readResume = () => {
+    let run = readJson(file, 'RUN_NOT_FOUND');
+    let next = run;
+    if (flags['issue-map'] !== undefined) {
+      requireFlag(flags, 'issue-map');
+      next = bindInitIssues(run, parseJsonArg(flags['issue-map'], 'issue-map'));
+    }
+    if (session) {
+      const ledger = boundLedger(next, personalLedgerKey(next.tier, dispatchSlot(next)));
+      if (!ledger) throw new CliError('LEDGER_NOT_BOUND', '运行态未绑定主控台账');
+      const owner = readForgeIssueOwner(next, ledger, session);
+      next = { ...next, controller: { ...next.controller, ...owner } };
+    }
+    const generated = scheduledTasksFor(next, configDir);
+    const controllerTask = generated.find(({ role }) => role === 'controller');
+    const scheduledTasks = (next.scheduledTasks ?? generated).map((task) => task.role === 'controller' && controllerTask
+      ? { ...task, description: controllerTask.description } : task);
+    if (next !== run) {
+      next = { ...next, scheduledTasks };
+      if (JSON.stringify(next) !== JSON.stringify(run)) {
+        run = { ...next, updatedAt: new Date().toISOString() };
+        writeJson(file, run);
+      }
+    }
+    return { ok: true, resumed: true, req, runPath: file, run, scheduledTasks, forgePlan: initForgePlan(run) };
+  };
+  const resume = () => flags['issue-map'] === undefined && !session ? readResume() : withFileLock(tickLockPath(file), readResume);
   if (fs.existsSync(file)) {
     if (flags.resume) return resume();
     throw alreadyExists();
   }
   const { spec, warnings } = buildRunSpec(flags, configDir);
   if (!spec.forge) throw new CliError('MISSING_FORGE', '工程档案未配置 forge（gitlab/github），拒绝初始化');
+  const unverified = missingVerificationRepos(spec);
+  if (unverified.length) {
+    const names = unverified.map((r) => r.name ?? r.repo).join('、');
+    throw new CliError(
+      'MISSING_VERIFICATION',
+      `verification.mode=local-test 下仓库 ${names} 既未配置验证命令，也未写明 verification.skipReason；请补充 verification.commands 或写明不测原因`,
+      { repos: unverified.map((r) => r.name ?? r.repo) },
+    );
+  }
   const reposWithOrigin = spec.repos.map((r) => ({
     ...r,
     baselineStartSha: r.baselineStartSha ?? resolveGitBaselineStartSha(r.path, spec.baselineBranch, r.branch),
@@ -1264,16 +1415,14 @@ function cmdInit(flags, configDir) {
     status: 'active',
     controller: {
       generation: 1,
-      sessionId: optFlag(flags, 'session') ?? `session-${Date.now().toString(36)}`,
+      sessionId: session ?? `session-${Date.now().toString(36)}`,
       state: '空闲',
       env: 'local',
       startedAt: now,
       lastWake: now,
     },
     changes: [],
-    review: { round: 1, rejectCount: 0 },
     worktrees: [],
-    blockers: [],
     participants: [],
     contractVersion: spec.contracts === false ? null : 'v1',
     createdAt: now,
@@ -1281,7 +1430,7 @@ function cmdInit(flags, configDir) {
     history: [{ at: now, type: 'init', tier: spec.tier, stage: spec.stage }],
   };
   run.ledgers = buildLedgers(run);
-  const plan = planFor(run);
+  const plan = planFor(run, configDir);
   run.scheduledTasks = plan.scheduledTasks;
   try {
     writeJson(file, run, { create: true });
@@ -1305,11 +1454,7 @@ function cmdInit(flags, configDir) {
     scheduledTasks: run.scheduledTasks,
     labels: plan.labels,
     confirmSheet: plan.confirmSheet,
-    forgePlan: {
-      issueCreates: run.ledgers.filter((l) => !l.issue).map((l) => ({ key: l.key, title: l.title, body: l.body })),
-      labelsSync: plan.labelsSync,
-      scheduledTasks: run.scheduledTasks,
-    },
+    forgePlan: initForgePlan(run, plan.labelsSync),
     warnings,
   };
 }
@@ -1323,10 +1468,6 @@ function resultDone(value) {
   return isPlainObject(value) && (value.done === true || value.ok === true || value.stopped === true || value.closed === true);
 }
 
-function issueNumber(value) {
-  return /^#?([1-9]\d*)$/.exec(String(value ?? '').trim())?.[1] ?? null;
-}
-
 function planUpgrade(run, to, slots, cfg) {
   const issues = { ...(run.issues ?? {}) };
   if (to === 'L2') issues.main = issues.main ?? issues.tracking ?? null;
@@ -1338,13 +1479,13 @@ function planUpgrade(run, to, slots, cfg) {
     issues,
     thresholds: { ...cfg.thresholds, ...run.thresholds },
     notify: { ...cfg.notify, ...run.notify },
-    autoMerge: run.autoMergeConfigured ? run.autoMerge : TIER_PROFILES[to].autoMerge,
+    autoMerge: !protectedMergeBaseline(run) && (run.autoMergeConfigured ? run.autoMerge : TIER_PROFILES[to].autoMerge),
     contracts: TIER_PROFILES[to].contracts,
     contractVersion: run.contractVersion ?? 'v1',
     rules: cfg.rules,
   };
   next.ledgers = buildLedgers(next);
-  next.scheduledTasks = scheduledTasksFor(next);
+  next.scheduledTasks = scheduledTasksFor(next, cfg.configDir);
 
   const hubKey = to === 'L2' ? 'main' : 'master';
   const hub = next.ledgers.find((l) => l.key === hubKey);
@@ -1380,7 +1521,7 @@ function planUpgrade(run, to, slots, cfg) {
       actions.push({ id: `slot-label:${slot}`, kind: 'issue-label', action: 'assign', slot, label: `槽位${slot}`, note: '给未分配的业务子 Issue 打槽位标签，不预指派账号' });
     }
   }
-  actions.push({ id: 'labels:sync', kind: 'labels', action: 'sync', labels: labelsFor(to, slots), args: labelsSyncArgs(next) });
+  actions.push({ id: 'labels:sync', kind: 'labels', action: 'sync', labels: labelsFor(to, slots, run.req), args: labelsSyncArgs(next) });
 
   const prev = new Map((run.scheduledTasks ?? []).map((t) => [t.id, t]));
   const added = next.scheduledTasks.filter((t) => !prev.has(t.id));
@@ -1389,7 +1530,7 @@ function planUpgrade(run, to, slots, cfg) {
     const old = prev.get(task.id);
     if (!old) actions.push({ id: `task:create:${task.id}`, kind: 'scheduled-task', action: 'create', task });
     else if (old.description !== task.description || old.ledgerKey !== task.ledgerKey || old.ledgerRef !== task.ledgerRef
-      || old.everyMinutes !== task.everyMinutes || old.at !== task.at) {
+      || old.everyMinutes !== task.everyMinutes || old.schedule !== task.schedule) {
       actions.push({ id: `task:update:${task.id}`, kind: 'scheduled-task', action: 'update', task });
     }
   }
@@ -1402,7 +1543,7 @@ function planUpgrade(run, to, slots, cfg) {
       `启用 ${t.mrIdleWarnHours}h 压单提醒与 ${t.ledgerMaxLines} 行台账检查。`,
     ]
     : [
-      `主研发机器另开「主研发调度」${t.controllerLoopMinutes}m 与「大巡检」${t.leadPatrolMinutes}m${next.notify.dailyReportEnabled ? `，日报 ${next.notify.dailyReportTime}` : '（日报未启用）'}。`,
+      `主研发机器另开「主研发调度」${t.controllerLoopMinutes}m 与「大巡检」${t.leadPatrolMinutes}m${next.notify.dailyReportEnabled ? `，由大巡检在 ${next.notify.dailyReportTime} 后首次唤醒时处理日报` : '（日报未启用）'}。`,
       `启用 P3 长期暂停 ${t.p3PauseMaxHours}h / 零产出静默 ${t.p3SilentMaxHours}h / MR 压单 ${t.mrIdleEscalateHours}h / 阻断 ${t.blockEscalateHours}h 客观探针。`,
     ];
   return { next, actions, added, removed, notes };
@@ -1471,7 +1612,7 @@ function cmdUpgrade(flags, configDir) {
     runPath: file,
     preserved,
     forgeObjects,
-    labels: labelsFor(to, slots),
+    labels: labelsFor(to, slots, run.req),
     scheduledTasks: plan.next.scheduledTasks,
     addedScheduledTasks: plan.added,
     removedScheduledTasks: plan.removed,
@@ -1508,8 +1649,7 @@ function cmdUpgrade(flags, configDir) {
 /* wake-decision                                                        */
 /* ------------------------------------------------------------------ */
 
-function cmdWakeDecision(flags) {
-  const input = parseJsonArg(flags.input, 'input');
+function evalWakeDecision(input) {
   const t = { ...THRESHOLD_DEFAULTS, ...(input.thresholds ?? {}) };
   const ledgerControllerId = input.ledgerControllerId ?? input.ledger?.controllerSessionId ?? null;
   const currentSessionId = input.currentSessionId ?? input.sessionId ?? null;
@@ -1533,69 +1673,39 @@ function cmdWakeDecision(flags) {
 
   let row;
   if (isSelf && state === '暂停') {
-    row = ['paused-hold', 'SELF_PAUSED_HOLD', 0, '暂停中：仅更新最近唤醒后退出；本人说「开工」才恢复原状态，不得自行开轮。'];
+    row = ['paused-hold', 'SELF_PAUSED_HOLD', '暂停中：仅更新最近唤醒后退出；本人说「开工」才恢复原状态，不得自行开轮。'];
   } else if (isSelf && offHours) {
-    row = ['heartbeat-only', 'OFF_HOURS_HEARTBEAT', 0, `非工作时段（${work.start}-${work.end} ${work.timezone}）：定时唤醒只更新最近唤醒，不开轮、不 push、不建 PR/MR、不改标签。`];
+    row = ['heartbeat-only', 'OFF_HOURS_HEARTBEAT', `非工作时段（${work.start}-${work.end} ${work.timezone}）：定时唤醒只更新最近唤醒，不开轮、不 push、不建 PR/MR、不改标签。`];
   } else if (isSelf && state === '空闲') {
-    row = ['start-round', 'SELF_IDLE_START', 1, '开始本轮：写「本轮：执行中」与开始时间、最近唤醒，对账推进，结束改空闲。'];
+    row = ['start-round', 'SELF_IDLE_START', '开始本轮：写「本轮：执行中」与开始时间、最近唤醒，对账推进，结束改空闲。'];
   } else if (isSelf && state === '执行中' && !explicit) {
     row = runningMinutes < stuckHours * 60
-      ? ['heartbeat', 'SELF_RUNNING_HEARTBEAT', 2, `未满 ${stuckHours}h：仅刷新最近唤醒后退出，不开新轮。`]
-      : ['self-heal', 'SELF_RUNNING_STUCK_HEAL', 2, `已满 ${stuckHours}h：重写「执行中」与开始时间，发【恢复】续接断点。`];
+      ? ['heartbeat', 'SELF_RUNNING_HEARTBEAT', `未满 ${stuckHours}h：仅刷新最近唤醒后退出，不开新轮。`]
+      : ['self-heal', 'SELF_RUNNING_STUCK_HEAL', `已满 ${stuckHours}h：重写「执行中」与开始时间，发【恢复】续接断点。`];
   } else if (isSelf && state === '执行中') {
-    row = ['confirm-previous-stopped', 'SELF_RUNNING_EXPLICIT', 3, '先向本人确认上一轮已停，确认后按断点重开并发【恢复】，不得并行开轮。'];
+    row = ['confirm-previous-stopped', 'SELF_RUNNING_EXPLICIT', '先向本人确认上一轮已停，确认后按断点重开并发【恢复】，不得并行开轮。'];
   } else if (offHours && (explicit || basis)) {
-    row = ['outside-work-hours-wait', 'OFF_HOURS_TAKEOVER_WAIT', 0, '非工作时段：等待进入工作时段或本人明确继续后再接任。'];
+    row = ['outside-work-hours-wait', 'OFF_HOURS_TAKEOVER_WAIT', '非工作时段：等待进入工作时段或本人明确继续后再接任。'];
   } else if (explicit) {
-    row = ['take-over-active', 'TAKEOVER_EXPLICIT', 4, '接管前本人先关旧会话；登记第 N+1 任、发【交接】、先停旧同名定时任务再自建本会话定时任务。'];
+    row = ['take-over-active', 'TAKEOVER_EXPLICIT', '接管前本人先关旧会话；登记第 N+1 任、发【交接】、先停旧同名定时任务再自建本会话定时任务。'];
   } else if (basis) {
-    row = ['take-over-by-basis', 'TAKEOVER_BY_BASIS', 5, '按依据接任：登记第 N+1 任、发【交接】/【恢复】、自建定时任务；遵守接任首轮边界。'];
+    row = ['take-over-by-basis', 'TAKEOVER_BY_BASIS', '按依据接任：登记第 N+1 任、发【交接】/【恢复】、自建定时任务；遵守接任首轮边界。'];
   } else {
-    row = ['exit-non-current', 'EXIT_NON_CURRENT', 6, `退出非现任会话：停用本会话定时任务并提示「已被第 ${generation} 任接替」。`];
+    row = ['exit-non-current', 'EXIT_NON_CURRENT', `退出非现任会话：停用本会话定时任务并提示「已被第 ${generation} 任接替」。`];
   }
-  const [action, code, tableRow, nextAction] = row;
-
-  const takeover = action.startsWith('take-over');
-  const firstRoundBoundary = takeover && !handoffComment;
-  const allowedWrites = {
-    'start-round': ['ledger', 'push', 'create-pr', 'change-label', 'timers'],
-    heartbeat: ['ledger-last-wake'],
-    'heartbeat-only': ['ledger-last-wake'],
-    'outside-work-hours-wait': [],
-    'paused-hold': ['ledger-last-wake'],
-    'self-heal': ['ledger', 'recovery-comment', 'push', 'create-pr', 'change-label'],
-    'confirm-previous-stopped': ['confirm-only'],
-    'exit-non-current': ['self-timer-stop'],
-  }[action] ?? ['identity', handoffComment ? 'handoff-comment' : 'recovery-comment', 'reconcile', 'timers', ...(firstRoundBoundary ? [] : ['push', 'create-pr', 'change-label'])];
-  const forbiddenWrites = firstRoundBoundary || allowedWrites[0] === 'ledger-last-wake' || action === 'outside-work-hours-wait'
-    ? ['push', 'create-pr', 'create-mr', 'change-label', 'external-write', ...(firstRoundBoundary ? [] : ['start-round'])]
-    : [];
-
-  let scope = 'none';
-  if (takeover) scope = firstRoundBoundary ? 'identity-only' : 'takeover';
-  else if (isSelf) scope = allowedWrites[0] === 'ledger-last-wake' ? 'heartbeat-only' : (action === 'confirm-previous-stopped' ? 'confirm-only' : 'full');
-  const allowed = takeover || (isSelf && (verified || scope === 'heartbeat-only'));
-  let reason;
-  if (action === 'outside-work-hours-wait') reason = '定时唤醒处于非工作时段，保留定时等待，禁止接任和写入。';
-  else if (!isSelf && !takeover) reason = `非现任主控（台账为第 ${generation} 任，本会话不是现任），禁止写台账、push、建 PR/MR、改标签；立即自停定时任务。`;
-  else if (takeover) reason = firstRoundBoundary ? '接任会话仅可写自身标识、【恢复】/【交接】并对账；首轮禁止 push、建 PR/MR、改标签。' : '接任会话已完成交接，可按台账推进。';
-  else if (!allowed) reason = '缺少台账主控标识或本会话标识：写入前必须先核对两者一致。';
-  else reason = scope === 'heartbeat-only' ? '仅允许刷新台账「最近唤醒」，其余写入一律禁止。' : '会话标识与台账第 1 节主控标识一致，可写。';
+  const [action, code, nextAction] = row;
+  const firstRoundBoundary = action.startsWith('take-over') && !handoffComment;
 
   return {
     ok: true,
     action,
     code,
-    tableRow,
     identity: { isSelf, verified, ledgerControllerId, currentSessionId, generation },
     state: { raw: rawState, normalized: state, runningMinutes, lastWakeMinutes },
     workHours: work,
     explicitTakeover: explicit,
     handoffBasis: basis,
     firstRoundBoundary,
-    allowedWrites,
-    forbiddenWrites,
-    writeGuard: { ledgerControllerId, currentSessionId, verified, isCurrent: isSelf, allowed, allowedWrites, requiresIdCheck: isSelf && !verified, scope, reason },
     selfHeal: {
       required: action === 'self-heal',
       atMinutes: stuckHours * 60,
@@ -1606,180 +1716,6 @@ function cmdWakeDecision(flags) {
     nextAction,
   };
 }
-
-/* ------------------------------------------------------------------ */
-/* eval-review                                                          */
-/* ------------------------------------------------------------------ */
-
-function parseReviewDeps(raw) {
-  return (Array.isArray(raw) ? raw : []).map((dep) => {
-    if (typeof dep === 'string') {
-      const m = /^(.*?)[!#](\d+)$/.exec(dep.trim());
-      return m ? { repo: m[1], id: Number(m[2]), state: null } : { repo: dep, id: null, state: null, invalid: true };
-    }
-    return { repo: dep?.repo ?? null, id: dep?.id ?? null, state: dep?.state ?? null };
-  });
-}
-
-function assessRisk(checks, declared) {
-  const missing = RISK_RULES.filter((r) => typeof checks?.[r.key] !== 'boolean').map((r) => r.key);
-  const matched = RISK_RULES.filter((r) => checks?.[r.key] === true);
-  let level = '未核验';
-  if (matched.length || declared === '高') level = '高';
-  else if (declared === '低' && missing.length === 0) level = '低';
-  return {
-    level,
-    source: matched.length ? 'rules' : (declared === '高' ? 'declared' : (level === '低' ? 'declared+rules' : 'missing')),
-    reasons: matched.length ? matched.map((m) => m.label) : (declared === '高' ? ['终审显式判定为高风险'] : []),
-    missingChecks: missing,
-    checks: RISK_RULES.map((r) => ({ key: r.key, label: r.label, matched: checks?.[r.key] === true, verified: typeof checks?.[r.key] === 'boolean' })),
-  };
-}
-
-function cmdEvalReview(flags, configDir) {
-  const input = parseJsonArg(flags.input, 'input');
-  const req = optFlag(flags, 'req');
-  const runPath = req ? runFile(configDir, req) : null;
-  const run = runPath ? readJson(runPath, 'RUN_NOT_FOUND') : null;
-  const review = input.review ?? {};
-  const change = input.change ?? {};
-  const t = { ...THRESHOLD_DEFAULTS, ...(input.thresholds ?? {}), ...(run?.thresholds ?? {}) };
-  const tier = normalizeTier(run?.tier ?? input.tier ?? 'L2');
-  const forge = run?.forge ?? (input.forge ? normalizeForge(input.forge) : null);
-  const baseline = run?.baselineBranch ?? input.baselineBranch ?? null;
-  const protectedBranches = validateBranchPatterns([...new Set([...ENV_BRANCHES, ...splitPatterns(run?.protectedEnvBranches ?? input.protectedEnvBranches)])]);
-  const autoMerge = run ? run.autoMerge === true : bool(input.autoMerge, TIER_PROFILES[tier].autoMerge);
-  const gitlabHost = run?.gitlabHost ?? input.gitlabHost ?? null;
-  const sessionId = review.sessionId ?? input.sessionId ?? null;
-  const dispatchedSessionId = input.dispatchedSessionId ?? review.dispatchedSessionId ?? input.dispatch?.sessionId ?? null;
-  const currentRound = num(input.currentRound ?? input.round ?? review.round ?? 1, 1);
-  const reviewRound = num(review.round ?? input.reviewRound ?? currentRound, currentRound);
-
-  const discard = (code, note, extra = {}) => ({ ok: true, action: 'discard', code, silent: true, effectiveRound: currentRound, note, labelPlan: { remove: [], add: [] }, merge: null, ...extra });
-  if (!dispatchedSessionId || !sessionId || String(dispatchedSessionId) !== String(sessionId)) {
-    return discard('STALE_REVIEW_SESSION', '结论前校验失败：本轮无「已派终审」记录，或最新记录对应会话不是自己；旧终审会话结论作废，静默退出不发结论。', { session: { sessionId, dispatchedSessionId } });
-  }
-  if (reviewRound !== currentRound) {
-    return discard('ROUND_MISMATCH', '超时重派不算新轮：旧轮次结论作废，由调度/主控回复「已作废：已重派」。', { reviewRound });
-  }
-  const conclusion = String(review.conclusion ?? input.conclusion ?? '').trim();
-  if (!['通过', '打回'].includes(conclusion)) throw new CliError('INVALID_CONCLUSION', `终审结论必须是「通过」或「打回」，收到：${conclusion}`);
-
-  const fuse = num(input.rejectFuseCount ?? t.rejectFuseCount, 2);
-  const rejectCount = num(input.rejectCount ?? input.history?.rejectCount, 0);
-  const rejectCountAfter = rejectCount + (conclusion === '打回' ? 1 : 0);
-  const fullReReview = rejectCount >= fuse;
-  const risk = assessRisk(input.riskChecks ?? review.riskChecks ?? null, review.risk ? String(review.risk) : null);
-  const riskLabel = { 高: '风险高', 低: '风险低' }[risk.level];
-  const rawDependencies = input.dependsOn ?? review.dependsOn;
-  const dependsOn = parseReviewDeps(rawDependencies);
-  const unresolvedDeps = dependsOn.filter((d) => String(d.state ?? '').toLowerCase() !== 'merged');
-  const dispatchedHeadSha = input.dispatchedHeadSha ?? review.dispatchedHeadSha ?? input.dispatch?.headSha ?? null;
-  const currentHeadSha = change.headSha ?? input.currentHeadSha ?? null;
-  const target = change.targetBranch ?? change.target ?? null;
-  const source = change.sourceBranch ?? change.source ?? input.sourceBranch ?? null;
-  const manualBy = tier === 'L3' ? '主研发本人' : '本人';
-  const ref = change.url ?? `${change.repo}#${change.id}`;
-
-  const out = (action, code, add, extra) => ({
-    ok: true,
-    action,
-    code,
-    effectiveRound: currentRound,
-    tier,
-    forge,
-    conclusion,
-    risk,
-    rejectCountAfter,
-    fullReReview,
-    gate: { baseline, target, protectedBranches, autoMerge, dispatchedHeadSha, currentHeadSha },
-    labelPlan: { remove: ['终审中'], add: add.filter(Boolean) },
-    merge: null,
-    ...extra,
-  });
-  const manual = (code, note) => out('manual-merge', code, [riskLabel, '待合并'], { decision: 'manual-merge', executor: manualBy, note });
-
-  if (fullReReview) {
-    const comment = conclusion === '打回' ? `打回第 ${rejectCountAfter} 次` : null;
-    return out('await-human-verdict', 'REJECT_FUSE_FULL_REVIEW', ['待合并'], {
-      ledger: { section2: `[待裁决] ${ref}` },
-      ...(comment ? { comment, actions: [{ kind: 'comment', body: comment }] } : {}),
-      note: `历史累计打回 k=${rejectCount}（≥${fuse}）：本次为全量重审，结论「${conclusion}」不再自动分流，一律「待合并」并在台账第 2 节列 [待裁决]，交${manualBy}裁决；打回计数照常累加为 ${rejectCountAfter}。`,
-    });
-  }
-  if (conclusion === '打回') {
-    return out('needs-changes', 'REVIEW_REJECTED', ['需修改'], {
-      comment: `打回第 ${rejectCountAfter} 次`,
-      fullReReviewRequired: rejectCountAfter >= fuse,
-      note: rejectCountAfter >= fuse
-        ? `同一 PR/MR 历史累计打回 k=${rejectCountAfter}（≥${fuse}）：再次送审必须标「全量重审」，结论出后一律交人裁决。`
-        : '提交方同分支只改必改项追加提交并逐条回复，换回「待终审」。',
-    });
-  }
-  const requestedRepo = change.repo ?? input.repo;
-  const repoName = requestedRepo == null ? null : String(requestedRepo);
-  const selected = run?.repos?.find((r) => r?.repo != null && String(r.repo) === repoName) ?? run?.repos?.find((r) => r?.name === repoName);
-  if (run && requestedRepo != null && !selected) {
-    return manual('REPO_NOT_IN_RUN', `${requestedRepo} 不在需求已勾选的仓库中，禁止自动合并。`);
-  }
-  const repo = selected?.repo ?? requestedRepo;
-  if (bool(input.conflict ?? change.conflict, false)) {
-    return out('needs-changes', 'MERGE_CONFLICT', ['需修改'], { comment: '合并冲突，需 rebase', rebaseReviewOnly: true, note: 'rebase 后重打「待终审」，非全量重审仅复审 rebase 差异。' });
-  }
-  if (dispatchedHeadSha && currentHeadSha && dispatchedHeadSha !== currentHeadSha) {
-    return out('re-review', 'HEAD_SHA_MISMATCH', ['待终审'], { reReviewRequired: true, note: `派审时 head=${dispatchedHeadSha}，当前 head=${currentHeadSha}：送审后有新提交，本结论不得用于合并，重新派审。` });
-  }
-  if (unresolvedDeps.length) {
-    return out('pending-merge', 'DEPENDS_ON_UNMERGED', [riskLabel, '待合并'], { blockedBy: unresolvedDeps, note: '存在未合入 Depends-On：不得自动合并；待前置依赖合入并 rebase 后再处理。' });
-  }
-  const repoProdTrunks = new Set([...PROD_TRUNKS, ...(selected?.branch ? [String(selected.branch)] : [])]);
-  if (source && repoProdTrunks.has(source)) {
-    return manual('PROD_TRUNK_MANUAL_SYNC', `源分支 ${source} 是当前仓生产主干：允许向需求基线同步，但禁止 AI 自动合并，由${manualBy}确认后手动合并。`);
-  }
-  if (source && matchesBranchPattern(source, protectedBranches)) {
-    return out('reject-source', 'SOURCE_ENV_BRANCH_FORBIDDEN', ['需修改'], {
-      decision: 'reject-source',
-      note: `源分支 ${source} 命中非主干受保护环境分支规则（${protectedBranches.join(', ')}）：严禁合入需求基线，立即拒绝。`,
-    });
-  }
-  if (risk.level === '高') return manual('HIGH_RISK_MANUAL', `终审通过但风险高：换「风险高」「待合并」，由${manualBy}手合。`);
-  if (risk.level !== '低') return manual('RISK_UNVERIFIED', `风险结论或 6 条风险核验缺失（${risk.missingChecks.join(',') || '未声明风险'}）：不得默认低风险，保留人工合并。`);
-  if (!autoMerge) {
-    return out('pending-merge', 'AUTO_MERGE_DISABLED', ['风险低', '待合并'], { executor: manualBy, note: '终审通过且风险低，但自动合并关闭：换「风险低」「待合并」，由本人手合。' });
-  }
-  if (!forge) return manual('MISSING_FORGE', '未确认 Forge：不回退默认值，保留人工合并。');
-  if (!repo || !change.id) return manual('CHANGE_UNIDENTIFIED', '变更单缺 repo/id：保留人工合并。');
-  if (!target || matchesBranchPattern(target, protectedBranches)) {
-    return manual('BLOCKED_ENV_BRANCH', `目标分支 ${target ?? '未知'} 未核实或命中受保护环境分支规则（${protectedBranches.join(', ')}）：禁止自动合并，只能人工合并。`);
-  }
-  if (!baseline || target !== baseline) return manual('TARGET_NOT_BASELINE', `目标分支 ${target} 不是已确认的需求基线 ${baseline ?? '未知'}：禁止自动合并。`);
-  if (!dispatchedHeadSha || !currentHeadSha) return manual('HEAD_SHA_MISMATCH', '缺派审 head SHA 或当前 head SHA：无法绑定终审提交，拒绝自动合并。');
-
-  const protectedArg = protectedBranches.some((p) => p.includes(',')) ? JSON.stringify(protectedBranches) : protectedBranches.join(',');
-  const args = [
-    'change-merge',
-    '--forge', forge,
-    '--repo', String(repo),
-    '--id', String(change.id),
-    '--head-sha', String(currentHeadSha),
-    '--target', baseline,
-    '--protected-branches', protectedArg,
-    '--depends-on', JSON.stringify(rawDependencies ?? []),
-  ];
-  if (runPath) args.push('--run', runPath);
-  if (forge === 'gitlab' && gitlabHost) args.push('--hostname', gitlabHost);
-  return out('auto-merge', 'LOW_RISK_AUTO_MERGE', ['风险低'], {
-    merge: { script: 'forge.mjs', command: 'change-merge', args },
-    comment: '终审通过｜风险低｜自动合并',
-    executor: tier === 'L3' ? '主研发调度' : '主控',
-    note: '终审通过 + 6 条风险全核验为低 + 自动合并开启 + 目标为需求基线 + SHA 绑定：调用 forge.mjs change-merge（合并前实查目标、SHA 与正文 Depends-On），读回已合入才记成功。',
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/* eval-patrol                                                          */
-/* ------------------------------------------------------------------ */
-
 
 /** `xxxHours` 视为上游已按工作时段核算；否则用时间戳 + now 按工作分钟累计。 */
 function workElapsed(item, hoursKey, atKey, ctx) {
@@ -1831,17 +1767,6 @@ function evalSmallPatrol(input, t, ctx) {
     out.push(finding('CONTRACT_LAG', 'correction', `CONTRACT_LAG:${ledgerRef}:${masterContract}`, '契约版本滞后',
       `【纠偏】契约版本滞后：小台账 ${ledger.contractVersion} → 总台账 ${masterContract}，请对齐后继续。`, { ledgerContract: ledger.contractVersion, masterContract }));
   }
-  const notLanded = (ledger.externalDocs ?? []).filter((d) => d?.landedInItems === false).map((d) => d.url ?? d);
-  if (notLanded.length) {
-    out.push(finding('EXTERNAL_DOC_NOT_LANDED', 'correction', `EXTERNAL_DOC_NOT_LANDED:${notLanded.join(',')}`, '外部设计文档未落入子 Issue 五项',
-      `【纠偏】外部设计文档未落五项：${notLanded.join('、')}，请同步到对应子 Issue 的范围/契约/拆分/验收/风险五项。`, { documents: notLanded }));
-  }
-  const staleHours = workElapsed(ledger, 'staleHours', 'updatedAt', ctx);
-  const staleLimit = num(t.ledgerStaleWorkdays, 1) * WORKDAY_HOURS;
-  if (!paused && staleHours >= staleLimit) {
-    out.push(finding('LEDGER_STALE', 'reminder', `LEDGER_STALE:${ledgerRef}:${ledger.updatedAt ?? 'unknown'}`, '台账长时间无变化',
-      `【提醒】台账正文已 ${staleHours.toFixed(1)} 工作小时无变化（≥ ${staleLimit}h），请刷新当前快照。`, { staleHours, staleLimit }));
-  }
 
   for (const change of input.changes ?? []) {
     const labels = labelNames(change.labels);
@@ -1873,10 +1798,6 @@ function evalSmallPatrol(input, t, ctx) {
     out.push(finding('CONTROLLER_DISCONNECTED', 'alert', `CONTROLLER_DISCONNECTED:g${gen}`, '主控失联',
       `【提醒】第 ${gen} 任主控失联 ${lastWakeHours.toFixed(1)}h（≥ ${t.disconnectCycles} 个主控周期），请新主控按依据接任。`, { generation: controller.generation ?? null, pullNewController: true }));
   }
-  if (num(controller.handoff?.waitingCycles ?? controller.handoffWaitingCycles, 0) >= num(t.handoffGraceCycles, 2)) {
-    out.push(finding('HANDOFF_GRACE_EXCEEDED', 'alert', `HANDOFF_GRACE_EXCEEDED:g${gen}`, '交接宽限期已过',
-      `【提醒】交接后 ${t.handoffGraceCycles} 个主控周期仍无新主控接上，请本人确认接管人。`));
-  }
   for (const item of input.confirmations ?? []) {
     const hours = workElapsed(item, 'hours', 'since', ctx);
     if (hours >= num(t.confirmTimeoutHours, 4)) {
@@ -1890,30 +1811,6 @@ function evalSmallPatrol(input, t, ctx) {
       out.push(finding('CORRECTION_TIMEOUT', 'reminder', `CORRECTION_TIMEOUT:${item.id ?? item.title}`, '纠偏未执行',
         `【提醒】【纠偏】「${item.title ?? item.id ?? ''}」超 ${hours.toFixed(1)}h 未回执，请回复「已执行」或「不执行：理由」。`, { id: item.id ?? null }));
     }
-  }
-  return out;
-}
-
-/** 结构化个人规矩（personalRules）也走第 5 探针的同一套客观越界检测。 */
-function personalRuleFindings(rules, { slot, ref, source, recipients }) {
-  const out = [];
-  const seen = new Set();
-  for (const rule of Array.isArray(rules) ? rules : []) {
-    if (typeof rule !== 'string' || !rule.trim()) continue;
-    const probe = checkPersonalPolicyOverride(rule.trim());
-    if (probe.ok !== false || !Array.isArray(probe.violations) || probe.violations.length === 0) continue;
-    const codes = probe.violations.map((item) => item.code).join(',');
-    const key = `PERSONAL_POLICY_VIOLATION:${ref}:rules:${codes}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(finding(
-      'PERSONAL_POLICY_VIOLATION',
-      'alert',
-      key,
-      '个人临时约定试图绕过 L3 公共门禁',
-      `槽位 ${slot} 个人规矩「${rule.trim()}」触发公共红线（${probe.violations.map((item) => item.reason ?? item.message ?? item.code).join('；')}）：该规矩无效，请立即撤销。`,
-      { slot, source, violations: probe.violations, personalRule: rule.trim(), recipients },
-    ));
   }
   return out;
 }
@@ -1970,34 +1867,6 @@ function evalLeadPatrol(input, t, ctx) {
       out.push(finding('CONTRACT_LAG_LEAD', 'alert', `CONTRACT_LAG_LEAD:${ledgerRef}:${master}`, '契约滞后',
         `槽位 ${slot} 契约 ${ledger.contractVersion} 落后总台账 ${master}。`, { slot, ledgerContract: ledger.contractVersion, masterContract: master, recipients: [who(ledger)] }));
     }
-    const policyText = typeof ledger.personalPolicy === 'string'
-      ? ledger.personalPolicy
-      : ledgerSection(ledger.body, 5);
-    if (policyText) {
-      const policyCheck = checkPersonalPolicyOverride(policyText);
-      if (policyCheck && policyCheck.ok === false && Array.isArray(policyCheck.violations) && policyCheck.violations.length > 0) {
-        const codes = policyCheck.violations.map((v) => v.code).join(',');
-        out.push(finding(
-          'PERSONAL_POLICY_VIOLATION',
-          'alert',
-          `PERSONAL_POLICY_VIOLATION:${ledgerRef}:${codes}`,
-          '个人临时约定试图绕过 L3 公共门禁',
-          `槽位 ${slot} 小台账个人约定触发公共红线（${policyCheck.violations.map((v) => v.reason ?? v.message ?? v.code).join('；')}）：该约定无效，请立即撤销。`,
-          { slot, violations: policyCheck.violations, recipients: [who(ledger), lead] },
-        ));
-      }
-    }
-    out.push(...personalRuleFindings(ledger.personalRules, {
-      slot, ref: ledgerRef, source: 'ledger', recipients: [who(ledger), lead],
-    }));
-  }
-  out.push(...personalRuleFindings(input.personalRules, {
-    slot: input.slot ?? '主研发', ref: 'personalRules', source: 'input', recipients: [lead],
-  }));
-  for (const doc of input.externalDocs ?? []) {
-    if (doc?.landedInItems !== false) continue;
-    out.push(finding('EXTERNAL_DOC_GAP', 'alert', `EXTERNAL_DOC_GAP:${doc.url}`, '外部设计文档未落五项',
-      `外部设计文档 ${doc.url ?? ''} 尚未同步到对应子 Issue 五项。`, { slot: doc.slot ?? null, url: doc.url ?? null, recipients: [who(doc)] }));
   }
   for (const esc of input.escalations ?? []) {
     const hours = workElapsed(esc, 'hours', 'since', ctx);
@@ -2013,140 +1882,48 @@ function evalLeadPatrol(input, t, ctx) {
   return out;
 }
 
-function cmdEvalPatrol(flags) {
-  const input = parseJsonArg(flags.input, 'input');
-  const t = { ...THRESHOLD_DEFAULTS, ...(input.thresholds ?? {}) };
-  const mode = String(input.mode ?? 'small').toLowerCase();
-  if (!['small', 'lead'].includes(mode)) throw new CliError('INVALID_PATROL_MODE', `巡检模式必须是 small/lead，收到：${mode}`);
-  const win = workWindow(input);
-  const mentionWin = { timezone: win.timezone, ...parseWindow(THRESHOLD_DEFAULTS.externalMentionWindow),
-    ...parseWindow(input.thresholds?.externalMentionWindow ?? input.notify?.externalMentionWindow), ...parseWindow(input.mentionWindow) };
-  if (input.timezone) mentionWin.timezone = String(input.timezone);
-  validateTimezone(mentionWin.timezone);
-  const nowMs = input.now ? parseInstant(input.now, 'now') : Date.now();
-  const work = windowAt(nowMs, win);
-  const ctx = { nowMs, win, offHours: !work.inside };
-
-  const findings = mode === 'small' ? evalSmallPatrol(input, t, ctx) : evalLeadPatrol(input, t, ctx);
-  if (mode === 'lead' && input.dailyReport === true) {
-    const day = formatLocal(nowMs, win.timezone).slice(0, 10);
-    findings.push(finding('DAILY_REPORT', 'report', `daily-report:${day}`, '每日日报', `生成 ${day} 的日报`));
-  }
-  const sent = new Set(list(input.sentKeys));
-  for (const f of findings) f.alreadySent = sent.has(f.key);
-  const fresh = findings.filter((f) => !f.alreadySent);
-  const quiet = fresh.length === 0;
-  const externalNotifyDisabled = bool(input.externalNotifyDisabled ?? input.notify?.externalNotifyDisabled, false);
-  const base = {
-    ok: true,
-    mode,
-    tier: input.tier ?? (mode === 'small' ? 'L2' : 'L3'),
-    quiet,
-    externalNotifySuppressed: externalNotifyDisabled,
-    findings,
-    newKeys: fresh.map((f) => f.key),
-    suppressedKeys: findings.filter((f) => f.alreadySent).map((f) => f.key),
-    workHours: work,
-  };
-
-  if (mode === 'small') {
-    const corrections = fresh.filter((f) => f.severity === 'correction').map((f) => f.text);
-    const reminders = fresh.filter((f) => f.severity !== 'correction').map((f) => f.text);
-    return {
-      ...base,
-      action: quiet ? 'quiet-exit' : 'notify',
-      corrections,
-      reminders,
-      mentions: [],
-      deferredMentions: [],
-      forgeOnly: externalNotifyDisabled ? [...corrections, ...reminders] : [],
-      notifications: externalNotifyDisabled ? [] : [...corrections, ...reminders],
-      report: quiet ? null : {
-        stage: input.stage ?? input.ledger?.stage ?? '未知',
-        currentWork: input.currentWork ?? input.ledger?.currentWork ?? '未知',
-        needsOwner: fresh.map((f) => ({ code: f.code, title: f.title, detail: f.detail })),
-        next: input.nextAction ?? '按 findings 逐项处理并回执',
-      },
-      note: quiet
-        ? '无新增待办或均已提醒过（sentKeys）：安静退出不刷屏。'
-        : (externalNotifyDisabled ? '外部推送已关闭：仅会话汇报并落 Forge 评论留证，不发外部私信。' : '命中待办或偏离：输出四项汇报。'),
-    };
-  }
-
-  const verifiedIds = isPlainObject(input.memberOpenIds) ? input.memberOpenIds : {};
-  const status = windowAt(nowMs, mentionWin);
-  const mentions = [];
-  const deferred = [];
-  const forgeOnly = [];
-  for (const f of fresh) {
-    const seen = new Set();
-    for (const r of f.recipients ?? []) {
-      if (!r.person || seen.has(r.person)) continue;
-      seen.add(r.person);
-      const mappedId = Object.hasOwn(verifiedIds, r.person) ? verifiedIds[r.person] : null;
-      const openId = r.openId ?? mappedId;
-      const item = { person: r.person, openId, code: f.code, key: f.key, text: f.text };
-      if (externalNotifyDisabled) {
-        forgeOnly.push({ ...item, reason: '外部推送已关闭（externalNotifyDisabled=true）：只落 Forge 评论留证，不发外部群/私信' });
-        continue;
-      }
-      const valid = typeof mappedId === 'string' && mappedId.trim() !== '' && mappedId === openId;
-      if (!valid) forgeOnly.push({ ...item, reason: '无同一 bot 核实的 openId：只落 Forge 评论留证，不发空 @' });
-      else if (status.inside) mentions.push(item);
-      else deferred.push({ ...item, deferredUntil: status.deferredUntil });
-    }
-  }
-  return {
-    ...base,
-    action: quiet ? 'quiet-exit' : (externalNotifyDisabled ? 'forge-only' : (mentions.length === 0 && deferred.length > 0 ? 'defer' : 'notify')),
-    corrections: [],
-    reminders: fresh.map((f) => f.text),
-    mentions,
-    deferredMentions: deferred,
-    forgeOnly,
-    notifications: mentions.map((m) => m.text),
-    window: status,
-    note: quiet
-      ? '无变化且无到期项：安静退出。'
-      : (externalNotifyDisabled
-        ? '外部推送已关闭（externalNotifyDisabled=true）：巡检照常运行并落 Forge 评论留证，不发外部群/私信。'
-        : (status.inside
-          ? '工作时段内：群内按成员映射真 @ 需要行动的人；无核实 openId 的只落 Forge 评论。'
-          : `非协作者工作时段（${status.start}-${status.end} ${status.timezone}）：先落 Forge 评论留证，群内 @ 暂存到 ${status.deferredUntil}。`)),
-  };
-}
-
 /* ------------------------------------------------------------------ */
 /* slot-claim                                                           */
 /* ------------------------------------------------------------------ */
 
-function slotKey(value) {
-  return String(value ?? '').trim().replace(/^槽位/, '');
+function liveSlotClaim(flags, configDir) {
+  const req = requireFlag(flags, 'req');
+  const slot = slotKey(requireFlag(flags, 'slot'));
+  const file = runFile(configDir, req);
+  const run = fs.existsSync(file) ? readJson(file) : null;
+  if (run && run.tier !== 'L3') throw new CliError('SLOT_CLAIM_REQUIRES_L3', '槽位绑定只适用于 L3');
+  const masterLink = run ? null : requireFlag(flags, 'master');
+  const currentSessionId = optFlag(flags, 'session') ?? run?.controller?.sessionId ?? requireFlag(flags, 'session');
+  const facts = readSlotClaimFacts(run, masterLink, { viewer: true });
+  const { slotLedgers, url, fragment, username } = facts;
+  const claims = forgeSlotClaims(facts);
+  const current = claims.find((claim) => claim.slot === slot && claim.sessionId === currentSessionId && claim.user?.toLowerCase() === username.toLowerCase() && !claim.withdrawn);
+  return {
+    slot, currentSessionId, currentUser: username, claims, masterUrl: url, fragment,
+    existingLedger: slotLedgers.some((ledger) => slotKey(ledger.slot) === slot),
+    ...(current ? { currentCommentUrl: `${url}#${fragment}${current.commentId}` } : {}),
+  };
 }
 
-function compareIds(a, b) {
-  if (/^\d+$/.test(a) && /^\d+$/.test(b)) return BigInt(a) < BigInt(b) ? -1 : (BigInt(a) > BigInt(b) ? 1 : 0);
-  return a.localeCompare(b);
-}
-
-function cmdSlotClaim(flags) {
-  const input = parseJsonArg(flags.input, 'input');
+function cmdSlotClaim(flags, configDir) {
+  const input = flags.input === undefined ? liveSlotClaim(flags, configDir) : parseJsonArg(flags.input, 'input');
   const slot = slotKey(optFlag(flags, 'slot') ?? input.slot);
   if (!slot) throw new CliError('MISSING_SLOT', '缺少 slot');
   const all = Array.isArray(input.claims) ? input.claims : [];
   const withdrawnIds = new Set((input.withdrawals ?? []).filter((w) => slotKey(w.slot) === slot).map((w) => String(w.claimId ?? w.commentId)));
-  const sameSlot = all.filter((c) => c && slotKey(c.slot) === slot);
-  const claims = sameSlot
-    .map((c) => ({ ...c, claimId: String(c.claimId ?? c.commentId ?? ''), at: parseInstant(c.createdAt ?? c.at, 'claims[].createdAt') }))
-    .filter((c) => !bool(c.withdrawn, false) && !withdrawnIds.has(c.claimId))
-    .sort((a, b) => (a.at - b.at) || compareIds(a.claimId, b.claimId));
-  const ignored = all.length - sameSlot.length;
+  const claims = activeSlotClaims(all, slot, (claim) => bool(claim.withdrawn, false) || withdrawnIds.has(claim.claimId),
+    (value) => parseInstant(value, 'claims[].createdAt'));
+  const ignored = all.filter((claim) => !claim || slotKey(claim.slot) !== slot).length;
   if (claims.length === 0) {
     return { ok: true, slot, winner: null, losers: [], ignored, currentWins: false, action: 'claim', ledgerAction: 'none', note: '本槽位当前无有效绑定，可发起绑定；绑定生效后再建或复用小台账。' };
   }
   const [winner, ...losers] = claims;
   const currentSessionId = input.currentSessionId ?? input.sessionId ?? null;
-  const currentWins = Boolean(currentSessionId && String(winner.sessionId) === String(currentSessionId));
+  const currentWins = input.currentUser
+    ? Boolean(winner.user && String(winner.user).toLowerCase() === String(input.currentUser).toLowerCase())
+    : Boolean(currentSessionId && String(winner.sessionId) === String(currentSessionId));
+  const rebind = currentWins && currentSessionId && winner.sessionId !== currentSessionId;
+  const oldLink = rebind && input.masterUrl ? `${input.masterUrl}#${input.fragment}${winner.commentId}` : null;
   return {
     ok: true,
     slot,
@@ -2156,11 +1933,13 @@ function cmdSlotClaim(flags) {
     currentWins,
     action: currentWins ? 'bound' : 'withdraw-binding',
     ledgerAction: currentWins ? (input.existingLedger ? 'reuse-existing-ledger' : 'create-ledger-after-bind') : 'none',
+    ...(oldLink ? { withdrawalComment: `【配置变更】撤回绑定：槽位${slot}｜原评论链接 ${oldLink}｜同一用户换会话` } : {}),
     comment: currentWins
-      ? `【配置变更】绑定 槽位${slot}｜${winner.sessionId}｜最早未撤回`
+      ? `【配置变更】绑定 槽位${slot}｜${input.currentUser ?? currentSessionId}｜${currentSessionId}`
       : `【配置变更】撤回绑定：槽位${slot}｜原评论链接 ${input.currentCommentUrl ?? '本会话绑定评论'}｜冲突：${winner.sessionId} 更早`,
     note: currentWins
-      ? '以本槽位最早未撤回绑定为准，绑定生效；此后才建或复用小台账并开始分派。'
+      ? rebind ? '同一 Forge 用户可复用小台账。先登记新会话绑定，撤回旧绑定后重新核实最早有效绑定。'
+        : '以本槽位最早未撤回绑定为准，绑定生效；此后才建或复用小台账并开始分派。'
       : '不改旧评论，追加撤回绑定评论后停下联系主研发，不建小台账、不覆盖他人指派。',
   };
 }
@@ -2193,104 +1972,101 @@ function mergeResults(prev = {}, next = {}) {
   return out;
 }
 
-function settled(state) {
-  return ['merged', 'closed', '已合入', '已关闭', '已合并'].includes(String(state ?? '').trim().toLowerCase());
-}
+/** @typedef {{kind: 'change'|'bug'|'blocker'|'membership', ref: string, state: string, repo: string, id: number, title?: string, url?: string}} TeardownResidue */
 
-function teardownLive(flags, prior) {
-  if (flags.live === undefined) return prior ?? {};
-  requireFlag(flags, 'live');
-  const live = parseJsonArg(flags.live, 'live');
-  if (!isPlainObject(live)) throw new CliError('INVALID_LIVE', '--live 必须是对象');
-  for (const key of ['openChanges', 'openBlockers', 'openBugs', 'ledgers']) {
-    if (Object.hasOwn(live, key) && (!Array.isArray(live[key]) || !live[key].every(isPlainObject))) {
-      throw new CliError('INVALID_LIVE', `--live 的 ${key} 必须是对象数组`);
+function teardownResidue(facts) {
+  const record = (item, kind, ref = issueRef(item)) => ({
+    kind, ref, state: item.state, repo: item.repo, id: item.id, title: item.title, url: item.url,
+  });
+  const master = facts.ledgers.find((item) => item.key === 'master');
+  const escalation = facts.ledgers.find((item) => item.key === 'escalation' && item.state === 'open');
+  /** @type {TeardownResidue[]} */
+  const residual = facts.changes.filter((item) => !isMerged(item.state) && item.state !== 'closed')
+    .map((item) => record(item, 'change'));
+  for (const warning of facts.warnings) {
+    if (['closed', 'merged'].includes(warning.state)) continue;
+    if (warning.kind === 'change' && warning.code === 'CHANGE_WRONG_TARGET') {
+      residual.push(record({ ...warning, title: warning.message }, 'change'));
+    } else {
+      residual.push(record({ ...warning, title: warning.message, state: warning.state ?? 'unknown' }, 'membership',
+        `${warning.kind}:${issueRef(warning)}`));
     }
   }
-  return { ...prior, ...live };
+  for (const item of facts.subIssues) {
+    if (item.state !== 'open') continue;
+    if (item.labels.includes('阻断')) residual.push(record(item, 'blocker'));
+    else if (item.labels.includes('bug')) residual.push(record(item, 'bug'));
+  }
+  for (const item of escalationsFor(escalation, master, ledgerSection)) {
+    if (item.blocking && !item.adjudicated) residual.push(record(escalation, 'blocker', item.id));
+  }
+  return residual;
 }
 
-function teardownLedgers(run, live) {
-  const byIssue = new Map();
-  const keys = new Set();
-  for (const ledger of [...(run.ledgers ?? []), ...(live.ledgers ?? [])]) {
-    const id = issueNumber(ledger.issue?.id ?? ledger.id);
-    const repo = ledger.repo ?? ledger.issue?.repo ?? run.hubRepo?.repo;
-    if (!id || !repo) {
-      if (live.ledgers?.includes(ledger)) throw new CliError('INVALID_LIVE', '--live 的 ledgers 必须包含实际 Issue 编号和可确认的仓库');
-      continue;
-    }
-    const ref = `${repo}#${id}`;
-    const previous = byIssue.get(ref);
-    let key = previous?.key ?? ledger.key ?? (ledger.slot ? `slot:${slotKey(ledger.slot)}` : ref);
-    if (!previous && keys.has(key)) key = `${key}:${ref}`;
-    keys.add(key);
-    byIssue.set(ref, { ...previous, ...ledger, repo, key, issue: ledger.issue ?? { id } });
-  }
-  return [...byIssue.values()];
+function teardownClosingSummary(facts) {
+  const merged = facts.changes.filter((change) => isMerged(change.state)).map(changeRef);
+  const incomplete = facts.errors.some(({ source }) => !source.startsWith('baseline:'));
+  const baselines = facts.baselines.map(({ repo, branch, sha }) => {
+    const prefix = facts.baselines.length > 1 ? `${repo} ` : '';
+    return `${prefix}${branch}@${sha ?? '读取失败'}`;
+  });
+  return {
+    changes: [merged.join('、'), incomplete ? 'Forge 实查不完整' : null].filter(Boolean).join('；') || '无',
+    baselines: baselines.join('、') || '未核实',
+  };
 }
 
-function teardownChecklist(run, live) {
-  const openChanges = live.openChanges ?? (run.changes ?? []).filter((c) => !settled(c.state));
-  const openBlockers = live.openBlockers ?? (run.blockers ?? []).filter((b) => !bool(b.closed, false));
-  const openBugs = live.openBugs ?? (run.bugs ?? []).filter((b) => !bool(b.closed, false) && !bool(b.verified, false));
-  const residual = [
-    ...openChanges.map((c) => ({ ...c, kind: 'change', ref: `${c.repo}#${c.id}`, state: c.state ?? 'unknown' })),
-    ...openBlockers.map((b) => ({ ...b, kind: 'blocker', state: b.state ?? 'open' })),
-    ...openBugs.map((b) => ({ ...b, kind: 'bug', state: b.state ?? 'open' })),
-  ];
-  const tasks = (run.scheduledTasks ?? []).map((task) => ({ kind: 'scheduled-task', taskId: task.id, role: task.role, host: run.user, action: 'stop-and-delete' }));
-  const ledgerTargets = teardownLedgers(run, live);
-  const participants = new Map((run.participants ?? []).filter((p) => slotKey(p.slot)).map((p) => [slotKey(p.slot), p]));
-  for (const ledger of ledgerTargets) {
-    const slot = slotKey(ledger.slot ?? (ledger.key.startsWith('slot:') ? ledger.key.slice(5) : null));
-    if (slot) {
-      const participant = participants.get(slot) ?? {};
-      participants.set(slot, { ...participant, user: participant.user ?? ledger.user ?? null, claimed: true });
-    }
-  }
-  const receipts = run.tier === 'L3'
-    ? normalizeSlots([...list(run.slots), ...participants.keys()]).filter((s) => s !== '主研发').map((slot) => {
+function teardownChecklist(run, facts, closingSummary, metrics, localLedgerKey) {
+  const { ledgers: ledgerTargets, slotClaims } = facts;
+  const residual = teardownResidue(facts);
+  const tasks = (run.scheduledTasks ?? []).filter((task) => !localLedgerKey || task.ledgerKey === localLedgerKey
+    || (!task.ledgerKey && ['controller', 'patrol'].includes(task.role)))
+    .map((task) => ({ kind: 'scheduled-task', taskId: task.id, role: task.role, host: run.user, action: 'stop-and-delete' }));
+  const participants = new Map((run.participants ?? []).map((p) => [slotKey(p.slot), p]));
+  const claimedSlots = new Map(slotClaims.map((claim) => [claim.slot, claim]));
+  const receipts = run.tier === 'L3' && !localLedgerKey
+    ? normalizeSlots([...list(run.slots), ...claimedSlots.keys()]).filter((s) => s !== '主研发').map((slot) => {
       const participant = participants.get(slot);
-      const claimed = Boolean(participant && participant.claimed !== false);
+      const claim = claimedSlots.get(slot);
+      const claimed = Boolean(claim);
       return {
         kind: 'remote-scheduled-task',
         slot,
         claimed,
-        user: participant?.user ?? null,
+        user: claim?.user ?? null,
         taskIds: participant?.tasks ?? [],
         need: claimed ? '协作者回执 {stopped:true,confirmedBy:"负责人"}' : '未认领槽位回执 {unclaimed:true}',
       };
     })
     : [];
-  const stillOpen = new Set(openChanges.map((c) => `${c.repo}#${c.id}`));
-  const merged = (run.changes ?? []).filter((c) => isMerged(c.state) && !stillOpen.has(`${c.repo}#${c.id}`)).map(changeRef);
+  const reviewSummary = metrics.changes === null ? '未核实'
+    : `${metrics.changes} 个变更单 / 累计打回 ${metrics.rejects} 次`;
   const ledgers = ledgerTargets.map((ledger) => {
-    const issue = issueNumber(ledger.issue.id);
-    const role = { master: '主研发调度', escalation: '主研发' }[ledger.kind] ?? '主控';
+    const issue = String(ledger.id);
+    const slot = ledger.key.startsWith('slot:') ? ledger.key.slice(5) : '主研发';
+    const role = { master: '主研发调度', escalation: '主研发' }[ledger.key] ?? '主控';
     const body = [
-      `${role} ｜ ${ledger.slot ?? '主研发'} ｜ ${run.controller?.sessionId ?? 'unknown'}`,
+      `${role} ｜ ${slot} ｜ ${run.controller?.sessionId ?? 'unknown'}`,
       `【完结】${run.req} 已收尾拆架`,
-      `- 已记录合入的变更单：${merged.length ? merged.join('、') : '无'}`,
-      `- 终审记录：${run.review?.round ?? 1} 轮 / 累计打回 ${run.review?.rejectCount ?? 0} 次`,
-      `- 上线基线：${run.branch ?? 'main'}@${run.baselineSha ?? '未记录'}`,
+      `- 已合入的变更单：${closingSummary?.changes ?? '未核实'}`,
+      `- 终审记录：${reviewSummary}`,
+      `- 上线基线：${closingSummary?.baselines ?? '未核实'}`,
     ].join('\n');
-    const common = ['--forge', String(run.forge), '--repo', String(ledger.repo), '--id', issue];
-    if (run.forge === 'gitlab' && run.gitlabHost) common.push('--hostname', run.gitlabHost);
+    const common = ['--forge', String(run.forge), '--repo', String(ledger.repo), '--id', issue, ...forgeHostArgs(run)];
     return {
       kind: 'issue-close',
       key: ledger.key,
-      issue: ledger.issue,
+      issue: { repo: ledger.repo, id: ledger.id },
       title: ledger.title,
       body,
       commands: [['issue-comment', ...common, '--body', body], ['issue-close', ...common]],
     };
   });
   const worktrees = (run.worktrees ?? []).map((w) => ({ kind: 'worktree', ...gitStatus(typeof w === 'string' ? w : w.path) }));
-  return { residual, tasks, receipts, ledgers, worktrees };
+  return { residual, tasks, receipts, ledgers, worktrees, closingSummary };
 }
 
-function verifyTeardown(check, results, repoResidue) {
+function verifyTeardown(check, results, repoResidue, ledgerFacts) {
   const failures = [];
   const need = (kind, id, reason) => failures.push({ kind, id, reason });
   const hasText = (value) => typeof value === 'string' && value.trim() !== '';
@@ -2305,9 +2081,12 @@ function verifyTeardown(check, results, repoResidue) {
       need(r.kind, r.slot, '已认领槽位需负责人确认任务已停用；只有未认领槽位可回执 unclaimed');
     }
   }
-  for (const ledger of check.ledgers) {
-    const v = results.ledgers?.[ledger.key];
-    if (v?.closed !== true && v?.status !== 'closed') need(ledger.kind, ledger.key, '台账未回执已留完结评论并关闭');
+  for (const ledger of ledgerFacts.ledgers) {
+    if (ledger.state !== 'closed') need('issue-close', ledger.key, `Forge 实查 ${ledger.repo}#${ledger.id} 仍为打开状态，请关闭台账后重试`);
+  }
+  for (const error of ledgerFacts.errors) {
+    const kind = error.source.startsWith('ledger:') ? 'issue-close' : 'forge-facts';
+    need(kind, error.source, `Forge 实查失败（${error.code}）：${error.message}`);
   }
   const kept = [];
   for (const wt of check.worktrees) {
@@ -2330,7 +2109,49 @@ function verifyTeardown(check, results, repoResidue) {
   return { failures, kept };
 }
 
+function archiveRunSidecars(file, archivePath, req) {
+  const base = file.slice(0, -'.json'.length);
+  const archiveDir = archivePath.replace(/\.json$/, '.state');
+  const suffixes = ['.outbox.json', ...Object.keys(TASK_DEFS).map((role) => `.tick-state.${role}.json`)];
+  for (const suffix of suffixes) {
+    const from = base + suffix;
+    if (!fs.existsSync(from)) continue;
+    // A v2.0 request may have the same name as a sidecar. Leave that run in place.
+    let value;
+    try { value = readJson(from); } catch (error) {
+      if (error.code !== 'INVALID_JSON') throw error;
+    }
+    if (value?.req) continue;
+    fs.mkdirSync(archiveDir, { recursive: true });
+    fs.renameSync(from, path.join(archiveDir, safeSlug(req) + suffix));
+  }
+  for (const journal of [tickHistoryPath(file), reviewJournalPath(file)]) {
+    if (!fs.existsSync(journal)) continue;
+    fs.mkdirSync(archiveDir, { recursive: true });
+    fs.renameSync(journal, path.join(archiveDir, path.basename(journal)));
+  }
+}
+
+function teardownMetrics(runPath) {
+  let reviews;
+  try { reviews = readReviews(runPath); } catch { reviews = null; }
+  const { scriptComments, tickHistoryError } = readTickHistory(runPath, { requireLog: true });
+  return {
+    changes: reviews ? new Set(reviews.map(({ pr }) => issueRef(pr))).size : null,
+    rejects: reviews?.filter(({ verdict }) => verdict?.conclusion === '打回').length ?? null,
+    fuses: reviews ? new Set(reviews.filter(({ merge }) => hasRejectFuse(merge)).map(({ pr }) => issueRef(pr))).size : null,
+    timeouts: tickHistoryError ? null : scriptComments.filter(({ code }) => code === 'REVIEW_TIMEOUT').length,
+  };
+}
+
 function cmdTeardown(flags, configDir) {
+  const req = requireFlag(flags, 'req');
+  const file = runFile(configDir, req);
+  const teardown = () => executeTeardown(flags, configDir);
+  return flags.finalize && fs.existsSync(file) ? withFileLock(tickLockPath(file), teardown) : teardown();
+}
+
+function executeTeardown(flags, configDir) {
   const req = requireFlag(flags, 'req');
   const file = runFile(configDir, req);
   const archivePath = path.join(configDir, 'runs', 'archive', `${safeSlug(req)}.json`);
@@ -2343,7 +2164,7 @@ function cmdTeardown(flags, configDir) {
       const forcedWaivers = archived.forcedWaivers ?? (archived.forced ? archived.residualAtStart ?? [] : []);
       const unverifiedItems = archived.unverifiedItems ?? [];
       const zeroResidue = archived.zeroResidue === true && !(retainedItems.length || forcedWaivers.length || unverifiedItems.length);
-      return { ok: true, status: 'archived', alreadyArchived: true, req, archivePath, retainedItems, forcedWaivers, unverifiedItems, zeroResidue };
+      return { ok: true, status: 'archived', alreadyArchived: true, req, archivePath, retainedItems, forcedWaivers, unverifiedItems, zeroResidue, ...(archived.metrics ? { metrics: archived.metrics } : {}) };
     }
     throw new CliError('RUN_NOT_FOUND', `文件不存在：${file}`);
   }
@@ -2355,17 +2176,47 @@ function cmdTeardown(flags, configDir) {
   const submitted = finalize ? parseJsonArg(flags.results, 'results') : {};
   if (!isPlainObject(submitted)) throw new CliError('INVALID_RESULTS', '--results 必须是对象');
   const results = mergeResults(prior.results, submitted);
-  const live = finalize ? prior.live : teardownLive(flags, prior.live);
+  delete results.ledgers;
   const forceNow = !finalize && bool(flags.force, false);
   const forced = forceNow || prior.forced === true;
-  const check = finalize ? prior.checklist : teardownChecklist(run, live);
-  if (!finalize && prior.checklist) {
-    const existingWorktrees = new Map(check.worktrees.map((wt) => [wt.path, wt]));
-    for (const wt of prior.checklist.worktrees.filter((item) => item.exists)) {
-      const current = existingWorktrees.get(wt.path);
-      if (!current?.exists || wt.dirty === true || (wt.dirty === null && current.dirty === false)) existingWorktrees.set(wt.path, wt);
+  // Recheck even a ledger removed from the master table after planning.
+  const priorLedgers = (prior.checklist?.ledgers ?? []).flatMap((ledger) => {
+    const { flags } = parseArgs(ledger.commands?.find((args) => args[0] === 'issue-close') ?? []);
+    return flags.repo && flags.id ? [{ key: ledger.key, repo: flags.repo, issue: { id: flags.id } }] : [];
+  });
+  const slot = dispatchSlot(run);
+  const localLedgerKey = run.tier === 'L3' && slot !== '主研发' ? personalLedgerKey(run.tier, slot) : null;
+  const runWithLedgers = { ...run, ledgers: [...(run.ledgers ?? []), ...priorLedgers] };
+  const facts = collectRunFacts(runWithLedgers, { includeBaselines: !finalize, localLedgerKey });
+  if (localLedgerKey && !facts.ledgers.some(({ key }) => key === localLedgerKey) && !facts.errors.length) {
+    facts.errors.push(factFailure('ledger:' + localLedgerKey, new CliError('LEDGER_NOT_BOUND', '无法核实本人已认领的小台账')));
+  }
+  const factErrors = facts.errors.filter(({ source }) => !source.startsWith('baseline:'));
+  if (!finalize && factErrors.length) {
+    return {
+      ok: false, status: 'incomplete', code: 'TEARDOWN_INCOMPLETE', req, runPath: file, runRetained: true,
+      failures: factErrors, membershipWarnings: facts.warnings, message: 'Forge 读取不全，请核实后重试拆架清单。', exitCode: 3,
+    };
+  }
+  const closingSummary = finalize ? prior.checklist.closingSummary : teardownClosingSummary(facts);
+  const metrics = teardownMetrics(file);
+  const check = teardownChecklist(run, facts, closingSummary, metrics, localLedgerKey);
+  if (finalize) {
+    if (!localLedgerKey) {
+      check.tasks = prior.checklist.tasks;
+      check.receipts = [...new Map([...prior.checklist.receipts, ...check.receipts].map((receipt) => [receipt.slot,
+        { ...receipt, claimed: receipt.claimed || prior.checklist.receipts.some((prior) => prior.slot === receipt.slot && prior.claimed) },
+      ])).values()];
     }
-    check.worktrees = [...existingWorktrees.values()];
+  }
+  if (prior.checklist) {
+    const probes = new Map(check.worktrees.map((worktree) => [worktree.path, worktree]));
+    for (const earlier of prior.checklist.worktrees.filter((item) => item.exists)) {
+      const current = probes.get(earlier.path) ?? { kind: 'worktree', ...gitStatus(earlier.path) };
+      if (!current.exists) probes.set(earlier.path, earlier);
+      else probes.set(earlier.path, current);
+    }
+    check.worktrees = [...probes.values()];
   }
   const now = new Date().toISOString();
 
@@ -2373,7 +2224,7 @@ function cmdTeardown(flags, configDir) {
   const waiverMap = new Map((prior.forcedWaivers ?? []).map((item) => [waiverKey(item), item]));
   const blocked = check.residual.filter((item) => !waiverMap.has(waiverKey(item)));
   if (blocked.length && !forceNow) {
-    writeJson(file, { ...run, teardown: { ...prior, phase: 'blocked', live, checklist: check }, updatedAt: now });
+    writeJson(file, { ...run, teardown: { ...prior, phase: 'blocked', checklist: check }, updatedAt: now });
     return {
       ok: false,
       status: 'blocked',
@@ -2381,6 +2232,7 @@ function cmdTeardown(flags, configDir) {
       runPath: file,
       runRetained: true,
       blocked,
+      membershipWarnings: facts.warnings,
       message: `发现 ${blocked.length} 项未结残留：请先处理，或确认后加 --force 强制收尾。`,
       exitCode: 3,
     };
@@ -2390,7 +2242,6 @@ function cmdTeardown(flags, configDir) {
   const resultsTemplate = {
     tasks: Object.fromEntries(check.tasks.map((x) => [x.taskId, { stopped: false }])),
     receipts: Object.fromEntries(check.receipts.map((x) => [x.slot, x.claimed ? { stopped: false, confirmedBy: x.user } : { unclaimed: false }])),
-    ledgers: Object.fromEntries(check.ledgers.map((x) => [x.key, { closed: false }])),
     worktrees: Object.fromEntries(check.worktrees.filter((w) => w.exists).map((w) => [w.path, {
       removed: false,
       ...(w.dirty === true ? { confirmedDiscard: false } : {}),
@@ -2399,7 +2250,7 @@ function cmdTeardown(flags, configDir) {
   };
 
   if (!finalize) {
-    writeJson(file, { ...run, teardown: { ...prior, phase: 'planned', forced, forcedWaivers, live, checklist: check, plannedAt: now, results }, updatedAt: now });
+    writeJson(file, { ...run, teardown: { ...prior, phase: 'planned', forced, forcedWaivers, checklist: check, plannedAt: now, results }, updatedAt: now });
     return {
       ok: true,
       phase: 'planned',
@@ -2413,10 +2264,33 @@ function cmdTeardown(flags, configDir) {
       scheduledTasksToStop: check.tasks,
       receipts: check.receipts,
       closingComments: check.ledgers,
+      forgeReadErrors: facts.errors,
+      membershipWarnings: facts.warnings,
       worktrees: check.worktrees,
       resultsTemplate,
       next: `逐项执行后：teardown --req ${req} --finalize --results <json>`,
     };
+  }
+
+  const primaryKey = primaryLedgerKey(run.tier);
+  const primaryLedger = facts.ledgers.find((item) => item.key === primaryKey) ?? null;
+  const latestAcc = latestAcceptance(primaryLedger);
+  const waiveReason = optFlag(flags, 'waive-acceptance');
+  let acceptanceFailure;
+  if (!localLedgerKey && acceptanceEnabled(run)) {
+    if (latestAcc?.conclusion !== '通过') acceptanceFailure = `最近验收结论为「${latestAcc?.conclusion ?? '无'}」`;
+    else if (matchingDeveloperModel(run, latestAcc.model)) acceptanceFailure = `验收模型 ${latestAcc.model} 与本运行态的开发模型相同`;
+    else {
+      try {
+        if (latestAcc.baselineSha !== readAcceptanceBaseline(run)) acceptanceFailure = '最近验收未覆盖当前远端需求基线';
+      } catch { acceptanceFailure = '无法核对当前远端需求基线 SHA'; }
+    }
+  }
+  if (acceptanceFailure && !waiveReason) {
+    throw new CliError('ACCEPTANCE_REQUIRED',
+      flags['waive-acceptance'] !== undefined ? '--waive-acceptance 必须提供放弃验收的原因'
+        : `${acceptanceFailure}，须验收通过后再归档，或传 --waive-acceptance <原因>`,
+      { req, runPath: file, runRetained: true, latestConclusion: latestAcc?.conclusion ?? null });
   }
 
   const meFile = findConfigFile(configDir, 'me');
@@ -2426,7 +2300,7 @@ function cmdTeardown(flags, configDir) {
     const st = gitStatus(r.path);
     return { repo: r.repo ?? r.name, ...st, agentsMdModified: st.files.some((l) => l.includes('AGENTS.md')) };
   });
-  const { failures, kept } = verifyTeardown(check, results, repoResidue);
+  const { failures, kept } = verifyTeardown(check, results, repoResidue, facts);
   if (failures.length) {
     writeJson(file, { ...run, teardown: { ...prior, phase: 'finalize-failed', forced, results, failures, lastAttemptAt: now }, updatedAt: now });
     return {
@@ -2437,8 +2311,9 @@ function cmdTeardown(flags, configDir) {
       runPath: file,
       runRetained: true,
       failures,
+      membershipWarnings: facts.warnings,
       resultsTemplate,
-      message: `${failures.length} 项未核验通过：运行态保留，补齐回执后重试同一命令。`,
+      message: failures.length + ' 项未核验通过：运行态保留，处理失败项后重试同一命令。',
       exitCode: 3,
     };
   }
@@ -2446,15 +2321,39 @@ function cmdTeardown(flags, configDir) {
     .map((r) => ({ kind: 'repo', repo: r.repo, path: r.path, status: r.status }));
   const zeroResidue = !(kept.length || forcedWaivers.length || unverifiedItems.length);
   const archivedAt = new Date().toISOString();
+  let acceptanceWaiver = null;
+  if (acceptanceFailure && waiveReason) {
+    const targetLedger = primaryLedger ?? boundLedger(run, primaryKey);
+    if (!targetLedger) throw new CliError('LEDGER_NOT_BOUND', '运行态未绑定主台账，无法记录放弃出口验收');
+    const waiverBody = [
+      `主控 ｜ ${slot} ｜ ${run.controller?.sessionId ?? 'unknown'}`,
+      '【出口验收】放弃验收并归档',
+      `放弃原因：${waiveReason}`,
+    ].join('\n');
+    const posted = postTickComment(run, 'issue', targetLedger, waiverBody, `acceptance-waive:${safeSlug(req)}`);
+    acceptanceWaiver = {
+      waived: true,
+      reason: waiveReason,
+      at: archivedAt,
+      previousConclusion: latestAcc?.conclusion ?? null,
+      commentId: posted?.commentId ?? null,
+    };
+  }
   writeJson(archivePath, {
     ...run,
+    ...(run.acceptance ? { acceptance: { enabled: acceptanceEnabled(run), guide: run.acceptance.guide ?? null } } : {}),
+    ...(acceptanceWaiver ? {
+      acceptance: { enabled: true, guide: run.acceptance.guide ?? null, waived: true, waiveReason, waivedAt: archivedAt, ...(acceptanceWaiver.commentId ? { waiverCommentId: acceptanceWaiver.commentId } : {}) },
+    } : {}),
     status: 'archived',
     archivedAt,
     teardown: {
-      phase: 'archived', forced, forcedWaivers, results, residualAtStart: check.residual, keptWorktrees: kept,
-      retainedItems: kept, unverifiedItems, closingComments: check.ledgers, zeroResidue,
+      phase: 'archived', forced, forcedWaivers, results, residualAtStart: prior.checklist.residual, keptWorktrees: kept,
+      retainedItems: kept, unverifiedItems, closingComments: check.ledgers, zeroResidue, metrics,
+      ...(acceptanceWaiver ? { acceptanceWaiver } : {}),
     },
   });
+  archiveRunSidecars(file, archivePath, req);
   fs.unlinkSync(file);
   const memoryAfter = { me: fileDigest(meFile), project: fileDigest(projectFile) };
   return {
@@ -2466,11 +2365,14 @@ function cmdTeardown(flags, configDir) {
     archivedAt,
     forced,
     forcedWaivers,
-    residualAtStart: check.residual,
+    ...(acceptanceWaiver ? { acceptanceWaiver } : {}),
+    residualAtStart: prior.checklist.residual,
     keptWorktrees: kept,
     retainedItems: kept,
     unverifiedItems,
     zeroResidue,
+    metrics,
+    membershipWarnings: facts.warnings,
     repoResidue,
     memoryPreserved: {
       me: { path: meFile, preserved: memoryBefore.me === memoryAfter.me },
@@ -2521,7 +2423,7 @@ function summarizeRunStatus(run, file) {
     nextAction = `存在未落盘升档（${pendingUpgrade.from}→${pendingUpgrade.to}）：完成外部台账与任务后执行 upgrade --req ${req} --to ${pendingUpgrade.to} --apply`;
     nextPrompt = `$xxn-lite-loop 继续完成 ${req} 从 ${pendingUpgrade.from} 到 ${pendingUpgrade.to} 的升档落盘`;
   } else if (pendingTeardown?.phase === 'blocked') {
-    nextAction = `拆架被未结项阻断：先合入/关闭未结 PR/MR 或阻断项，再传 --live 重跑 teardown`;
+    nextAction = `拆架被未结项阻断：先合入/关闭未结 PR/MR 或阻断项，再重跑 teardown`;
     nextPrompt = `$xxn-lite-loop 检查 ${req} 未结项并继续收尾拆架`;
   } else if (pendingTeardown) {
     nextAction = `拆架清单已生成（${pendingTeardown.phase}）：停任务、关台账、清 worktree 后执行 teardown --req ${req} --finalize --results <json>`;
@@ -2540,16 +2442,45 @@ function summarizeRunStatus(run, file) {
     stage,
     forge: run.forge ?? null,
     baselineBranch: run.baselineBranch ?? null,
-    autoMerge: run.autoMerge === true,
+    autoMerge: run.tier === 'L3' && dispatchSlot(run) !== '主研发' ? null : run.autoMerge === true && !protectedMergeBaseline(run),
     repos: (run.repos ?? []).map((r) => r.repo ?? r.name),
     issues: run.issues ?? {},
     runPath: file,
     updatedAt: run.updatedAt ?? run.createdAt ?? null,
     pendingUpgrade,
     pendingTeardown,
+    ...readTickHistory(file),
     nextAction,
     nextPrompt,
   };
+}
+
+function liveStatus(base, input, run, runPath) {
+  const facts = !input && run ? collectRunFacts(run) : null;
+  if (!facts) return buildLiveStatus(base, input, run, facts);
+  try {
+    const history = readReviews(runPath);
+    for (const change of facts.changes) {
+      const records = reviewsFor(history, change);
+      change.review = resolveReviewState(records, change.comments, change.headSha);
+      change.mergeWaiting = isWaitingMerge(records.at(-1), change);
+    }
+  } catch (error) {
+    facts.errors.push(factFailure('review-journal', error));
+  }
+  const overview = buildLiveStatus(base, input, run, facts);
+  const scriptComments = [];
+  for (const [kind, items] of [['issue', [...facts.ledgers, ...facts.subIssues]], ['change', facts.changes]]) {
+    for (const item of items) {
+      for (const note of item.comments) {
+        const [signature, reason] = note.body.split(/\r?\n/, 2);
+        if (!/^巡检脚本 ｜ [^｜]+ ｜ \S+$/.test(signature) && !(note.liteloopKey && / ｜ tick:\S+$/.test(signature))) continue;
+        scriptComments.push({ kind, repo: item.repo, id: item.id, commentId: note.id, at: note.createdAt, signature, reason });
+      }
+    }
+  }
+  scriptComments.sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || b.commentId - a.commentId);
+  return { ...overview, forgeFacts: facts, scriptComments };
 }
 
 function cmdStatus(flags, configDir) {
@@ -2558,6 +2489,7 @@ function cmdStatus(flags, configDir) {
   const needsOnboarding = !meFile || projects.length === 0;
   const req = optFlag(flags, 'req') ?? optFlag(flags, 'run');
   const liveArg = optFlag(flags, 'live-input') ?? optFlag(flags, 'live');
+  const asJson = flags.json === true;
   const showLive = Boolean(flags.live || liveArg);
   const live = liveArg ? parseJsonArg(liveArg, 'live-input') : null;
   if (liveArg && !isPlainObject(live)) throw new CliError('INVALID_JSON', '--live-input 必须是 JSON 对象');
@@ -2565,6 +2497,18 @@ function cmdStatus(flags, configDir) {
   if (req && liveReq !== null && liveReq !== req) {
     throw new CliError('LIVE_REQ_CONFLICT', 'live 输入的 req 与 --req 不一致', { req, liveReq });
   }
+  const present = (base, run) => {
+    const useLive = showLive || (!asJson && run?.forge);
+    const runPath = base.run?.runPath ?? base.activeRuns?.find(({ req }) => req === run?.req)?.runPath;
+    const result = useLive ? { ...base, live: liveStatus(base, live, run, runPath) } : base;
+    if (useLive && run?.tier === 'L3' && dispatchSlot(run) !== '主研发') {
+      const master = result.live?.forgeFacts?.ledgers.find(({ key }) => key === 'master');
+      const autoMerge = mergeModeFromMaster(run, master);
+      if (base.run) result.run = { ...base.run, autoMerge };
+      else result.activeRuns = base.activeRuns.map((summary) => summary.req === run.req ? { ...summary, autoMerge } : summary);
+    }
+    return asJson ? result : formatStatus(result, run);
+  };
 
   if (req) {
     const file = runFile(configDir, req);
@@ -2579,12 +2523,12 @@ function cmdStatus(flags, configDir) {
         projects,
         run: summarizeRunStatus(rawRun, file),
       };
-      return showLive ? { ...result, live: buildLiveStatus(result, live, rawRun) } : result;
+      return present(result, rawRun);
     }
     const archivePath = path.join(configDir, 'runs', 'archive', `${safeSlug(req)}.json`);
     if (fs.existsSync(archivePath)) {
       const archived = readJson(archivePath);
-      return {
+      const result = {
         ok: true,
         readOnly: true,
         state: 'archived',
@@ -2595,6 +2539,7 @@ function cmdStatus(flags, configDir) {
         nextAction: '该需求已完成拆架归档，无需继续处理。',
         nextPrompt: '$xxn-lite-loop <一句话描述你的下一个新需求>',
       };
+      return asJson ? result : formatStatus(result, archived);
     }
     throw new CliError('RUN_NOT_FOUND', `未找到运行态或归档记录：${req}`);
   }
@@ -2604,13 +2549,13 @@ function cmdStatus(flags, configDir) {
   const rawRuns = new Map();
   if (fs.existsSync(runsDir)) {
     for (const name of fs.readdirSync(runsDir).sort()) {
-      if (!name.endsWith('.json')) continue;
+      if (!name.endsWith('.json') || isRunSidecar(name)) continue;
       const full = path.join(runsDir, name);
       if (!fs.statSync(full).isFile()) continue;
       const rawRun = readJson(full);
       const summary = summarizeRunStatus(rawRun, full);
       activeRuns.push(summary);
-      if (showLive) rawRuns.set(summary.req, rawRun);
+      if (showLive || !asJson) rawRuns.set(summary.req, rawRun);
     }
   }
   const archiveDir = path.join(runsDir, 'archive');
@@ -2645,19 +2590,321 @@ function cmdStatus(flags, configDir) {
     nextAction,
     nextPrompt,
   };
-  if (showLive) {
-    if (liveReq !== null && !rawRuns.has(liveReq)) {
-      throw new CliError('LIVE_REQ_NOT_FOUND', 'live 输入的 req 未匹配任何活跃需求', { liveReq });
-    }
-    const selected = rawRuns.get(liveReq ?? activeRuns[0]?.req) ?? null;
-    return { ...baseResult, live: buildLiveStatus(baseResult, live, selected) };
+  if (liveReq !== null && !rawRuns.has(liveReq)) {
+    throw new CliError('LIVE_REQ_NOT_FOUND', 'live 输入的 req 未匹配任何活跃需求', { liveReq });
   }
-  return baseResult;
+  return present(baseResult, rawRuns.get(liveReq ?? activeRuns[0]?.req) ?? null);
 }
 
 /* ------------------------------------------------------------------ */
 /* 入口                                                                  */
 /* ------------------------------------------------------------------ */
+
+function tickOperations(req, configDir) {
+  return {
+    req, configDir, readJson, writeJson, workWindow, mentionWindow, windowAt, hm, workHoursBetween, addWorkingHours, ledgerSection, personalLedgerKey,
+    evalWakeDecision, evalSmallPatrol, evalLeadPatrol, defaults: THRESHOLD_DEFAULTS,
+  };
+}
+
+function cmdTick(flags, configDir) {
+  const req = requireFlag(flags, 'req');
+  const role = requireFlag(flags, 'role');
+  const now = optFlag(flags, 'now');
+  const session = flags.session === undefined ? null : requireFlag(flags, 'session');
+  return tick(runFile(configDir, req), role, flags.apply === true, now ? parseInstant(now, 'now') : Date.now(), tickOperations(req, configDir), session);
+}
+
+function matchNotifyMembers(run, members) {
+  const participants = new Map([[run.user, run.user]]);
+  for (const member of [...(run.ledgers ?? []), ...(run.participants ?? [])]) {
+    if (!member?.user || member.claimed === false) continue;
+    participants.set(member.user, member.displayName ?? member.name ?? member.user);
+  }
+  if (run.tier === 'L3' && boundLedger(run, 'master')) {
+    const facts = readSlotClaimFacts(run);
+    const claims = forgeSlotClaims(facts);
+    for (const slot of new Set(claims.map(({ slot }) => slot))) {
+      const winner = activeSlotClaims(claims, slot)[0];
+      if (!winner?.user || participants.has(winner.user)) continue;
+      const displayName = facts.slotLedgers.find((entry) => slotKey(entry.slot) === slot)?.user;
+      participants.set(winner.user, displayName && !/^(无|-|待认领)$/.test(displayName) ? displayName : winner.user);
+    }
+  }
+  const people = [...participants].filter(([user]) => typeof user === 'string' && user)
+    .map(([user, name]) => [user, String(name).trim()]);
+  const matches = [];
+  const unmatchedMembers = [];
+  for (const [user, name] of people) {
+    const matching = new Set(members.filter((member) => member?.name?.trim() === name && /^ou_[a-z0-9_]+$/i.test(member.member_id))
+      .map((member) => member.member_id));
+    const ambiguous = matching.size > 1 || people.some(([other, theirName]) => other !== user && theirName === name);
+    if (matching.size === 1 && !ambiguous) matches.push([user, [...matching][0]]);
+    else unmatchedMembers.push({ user, name, reason: ambiguous ? '同名，无法唯一匹配' : '群成员中未找到同名用户' });
+  }
+  return { memberOpenIds: Object.fromEntries(matches), unmatchedMembers };
+}
+
+function assertL1AutoMerge(run) {
+  const facts = collectRunFacts(run);
+  if (facts.errors.length) throw new CliError('FORGE_FACTS_UNAVAILABLE', '无法核实 L1 需求的变更单，当前使用人工合并', { errors: facts.errors });
+  if (facts.changes.filter(({ state, draft }) => !draft && ['open', 'merged'].includes(state)).length < 2) {
+    throw new CliError('L1_AUTO_MERGE_REQUIRES_MULTIPLE_CHANGES', 'L1 须拆成多个变更单并使用独立需求基线，才能开启自动合并');
+  }
+}
+
+function cmdMergeMode(flags, configDir) {
+  const req = requireFlag(flags, 'req');
+  const autoMerge = flags.auto === true;
+  if (autoMerge ? flags.manual !== undefined : flags.manual !== true || flags.auto !== undefined) {
+    throw new CliError('INVALID_MERGE_MODE', '请选择 --manual 或 --auto');
+  }
+  const file = runFile(configDir, req);
+  return withFileLock(tickLockPath(file), () => {
+    const run = readJson(file, 'RUN_NOT_FOUND');
+    if (run.status === 'archived') throw new CliError('RUN_ARCHIVED', '该需求已归档');
+    const slot = dispatchSlot(run);
+    if (run.tier === 'L3' && slot !== '主研发') {
+      throw new CliError('MERGE_ROLE_FORBIDDEN', 'L3 由主研发切换合并方式');
+    }
+    if (autoMerge && protectedMergeBaseline(run)) {
+      throw new CliError('ENV_BRANCH_FORBIDDEN', '需求基线是受保护分支，请使用全人工合并');
+    }
+    if (autoMerge && run.tier === 'L1') assertL1AutoMerge(run);
+    const changed = run.autoMerge !== autoMerge || run.autoMergeConfigured !== true;
+    if (!changed) return { ok: true, req, autoMerge, changed };
+    const ledger = boundLedger(run, personalLedgerKey(run.tier, slot));
+    if (!ledger) throw new CliError('LEDGER_NOT_BOUND', '请先绑定本人台账，以记录合并方式变更');
+    if (readForgeIssueState(run, ledger.repo, ledger.id, { rejectConflictingLabels: true }) !== 'open') {
+      throw new CliError('LEDGER_CLOSED', '本人台账已关闭，无法记录合并方式变更');
+    }
+    const code = autoMerge ? 'MERGE_MODE_AUTO' : 'MERGE_MODE_MANUAL';
+    const key = `merge-mode:${req}:${fs.statSync(file, { bigint: true }).mtimeNs}:${autoMerge}`;
+    const body = formatScriptComment(slot, code, '【配置变更】');
+    const master = run.tier === 'L3' ? boundLedger(run, 'master') : null;
+    if (run.tier === 'L3' && (!master || readForgeIssueState(run, master.repo, master.id, { rejectConflictingLabels: true }) !== 'open')) {
+      throw new CliError('LEDGER_NOT_BOUND', '请先绑定开放的总台账，以同步主研发的合并方式');
+    }
+    const posted = postTickComment(run, 'issue', ledger, body, key);
+    if (master) postTickComment(run, 'issue', master, body, key);
+    writeJson(file, { ...run, autoMerge, autoMergeConfigured: true });
+    return { ok: true, req, autoMerge, changed, ledger: { ...ledger, ...posted } };
+  });
+}
+
+function notifyLedger(run, scope, action) {
+  const slot = run.slot ?? run.scheduledTasks?.find((task) => task.role === 'patrol')?.ledgerKey?.match(/^slot:(.+)$/)?.[1] ?? '主研发';
+  const personal = run.tier === 'L3' ? `slot:${slot}` : personalLedgerKey(run.tier);
+  const keys = run.tier === 'L3' && scope === 'run' && action === 'bind' ? ['master']
+    : scope === 'project' && run.tier === 'L3' ? ['master', personal] : [personal, 'master'];
+  for (const key of keys) {
+    const ledger = boundLedger(run, key);
+    if (ledger) return { ...ledger, slot };
+  }
+  throw new CliError('LEDGER_NOT_BOUND', '请先将需求绑定到 Git 台账，以记录通知配置变更');
+}
+
+const NOTIFY_CONFIG_CODES = { bind: 'NOTIFY_BIND', unbind: 'NOTIFY_UNBIND', mute: 'NOTIFY_MUTE', unmute: 'NOTIFY_UNMUTE' };
+
+function updateNotifyConfig(sub, flags, configDir) {
+  const req = requireFlag(flags, 'req');
+  const scope = flags.scope === undefined ? 'run' : requireFlag(flags, 'scope');
+  if (!['run', 'project'].includes(scope)) throw new CliError('INVALID_NOTIFY_SCOPE', '--scope 必须是 run 或 project');
+  const chat = sub === 'bind' ? requireFlag(flags, 'chat').trim() : null;
+  const runPath = runFile(configDir, req);
+  return withFileLock(tickLockPath(runPath), () => {
+    const run = readJson(runPath, 'RUN_NOT_FOUND');
+    if (run.status === 'archived') throw new CliError('RUN_ARCHIVED', '该需求已归档');
+    if (sub === 'bind' && run.tier === 'L1' && scope === 'run') {
+      throw new CliError('NOTIFY_GROUP_UNAVAILABLE', 'L1 只有会话通知。可用 --scope project 为后续 L2/L3 需求设置工程默认群。');
+    }
+    const file = scope === 'run' ? runPath : run.project && findConfigFile(path.join(configDir, 'projects'), safeSlug(run.project));
+    if (!file) throw new CliError('PROJECT_CONFIG_NOT_FOUND', '运行态关联的工程档案不存在');
+    const update = () => {
+      const current = scope === 'run' ? run : loadConfigFile(file);
+      const notify = { ...current.notify };
+      const code = NOTIFY_CONFIG_CODES[sub];
+      const group = sub === 'bind' ? verifyGroup(chat) : null;
+      const { memberOpenIds, unmatchedMembers } = group ? matchNotifyMembers(run, group.members) : {};
+      if (group) Object.assign(notify, { feishuGroupChatId: group.chatId, memberOpenIds });
+      else if (sub === 'unbind') {
+        notify.feishuGroupChatId = null;
+        if (current.notify?.feishuGroupChatId || scope === 'project') notify.memberOpenIds = {};
+      } else notify.externalNotifyDisabled = sub === 'mute';
+
+      const changed = !isDeepStrictEqual(current.notify ?? {}, notify);
+      const result = {
+        ok: true, req, scope, changed, action: sub, muted: notify.externalNotifyDisabled === true,
+        chatId: notify.feishuGroupChatId ?? null, ...(group ? { chatName: group.name, matchedCount: Object.keys(memberOpenIds).length, unmatchedMembers } : {}),
+      };
+      if (!changed) return result;
+      const desired = { ...current, notify };
+      const projectText = scope === 'project' ? projectNotifyText(file, desired) : null;
+      const ledger = notifyLedger(run, scope, sub);
+      if (readForgeIssueState(run, ledger.repo, ledger.id) !== 'open') throw new CliError('LEDGER_CLOSED', '台账已关闭，无法记录通知配置变更');
+      const version = fs.statSync(file, { bigint: true }).mtimeNs.toString();
+      const key = 'notify-config:' + crypto.createHash('sha256').update(JSON.stringify([scope, scope === 'project' ? run.project : req, version, sub, notify]))
+        .digest('hex').slice(0, 24);
+      const target = scope === 'run' ? '仅本次需求' : '工程默认值，后续需求使用';
+      const clean = (value) => String(value).replace(/[\r\n<>]/g, ' ').slice(0, 120);
+      const detail = group ? ` ｜ 群：${clean(group.name)} ｜ 已匹配 ${result.matchedCount} 人 ｜ 未匹配：${unmatchedMembers.map(({ name }) => clean(name)).join('、') || '无'}` : '';
+      const body = formatScriptComment(ledger.slot, code, `【配置变更】范围：${target}${detail}`);
+      const posted = postTickComment(run, 'issue', ledger, body, key);
+      // 先留下用户确认的操作，再写本机。重试同一次写入复用同一个评论去重键。
+      if (scope === 'run') writeJson(file, desired);
+      else writeAtomic(file, projectText);
+      return { ...result, ledger: { repo: ledger.repo, id: ledger.id, ...posted } };
+    };
+    return scope === 'project' ? withFileLock(file + '.notify.lock', update) : update();
+  });
+}
+
+function cmdNotify(flags, configDir, positional) {
+  const sub = positional[1];
+  const configCommands = ['bind', 'unbind', 'mute', 'unmute'];
+  if (![...configCommands, 'enqueue', 'confirm', 'flush'].includes(sub)) {
+    throw new CliError('INVALID_NOTIFY_COMMAND', 'notify 子命令必须是 bind、unbind、mute、unmute、enqueue、confirm 或 flush');
+  }
+  const rawNow = optFlag(flags, 'now');
+  const nowMs = rawNow ? parseInstant(rawNow, 'now') : Date.now();
+  const lib = { readJson, writeJson, workWindow, mentionWindow, windowAt, addWorkingHours };
+  if (configCommands.includes(sub)) return updateNotifyConfig(sub, flags, configDir);
+  const useOutbox = (file, operation) => runNotification(file, nowMs, lib, operation);
+  if (sub === 'enqueue') {
+    const file = runFile(configDir, requireFlag(flags, 'req'));
+    const kind = requireFlag(flags, 'kind');
+    const dedupKey = requireFlag(flags, 'dedup');
+    const text = requireFlag(flags, 'text');
+    return useOutbox(file, (outbox) => ({
+      ok: true, ...outbox.enqueue({ kind, dedupKey, text, confirmRequired: flags['confirm-required'] === true }),
+    }));
+  }
+  if (sub === 'confirm') {
+    const file = runFile(configDir, requireFlag(flags, 'req'));
+    const id = requireFlag(flags, 'id');
+    return useOutbox(file, (outbox) => ({ ok: true, event: outbox.confirm(id) }));
+  }
+  const req = optFlag(flags, 'req');
+  const all = flags.all === true;
+  if (Boolean(req) === all) throw new CliError('INVALID_NOTIFY_SCOPE', 'notify flush 必须择一提供 --req <slug> 或 --all');
+  const flush = (file) => useOutbox(file, (outbox, run) => ({
+    req: run.req, actions: outbox.flush(true, true, patrolAlertStatus(file, nowMs, tickOperations(run.req, configDir), run)),
+  }));
+  if (req) return { ok: true, runs: [flush(runFile(configDir, req))] };
+  const dir = path.join(configDir, 'runs');
+  const runs = [];
+  const errors = [];
+  const names = fs.existsSync(dir) ? fs.readdirSync(dir, { withFileTypes: true }) : [];
+  for (const name of names.filter((entry) => entry.isFile() && entry.name.endsWith('.outbox.json')).map((entry) => entry.name).sort()) {
+    const base = name.slice(0, -'.outbox.json'.length);
+    const file = path.join(dir, base + '.json');
+    if (!fs.existsSync(file)) continue;
+    try {
+      runs.push(flush(file));
+    } catch (error) {
+      if (error.code === 'RUN_ARCHIVED') continue;
+      errors.push({ req: base, code: error.code ?? 'UNEXPECTED_ERROR', message: error.message });
+    }
+  }
+  return { ok: errors.length === 0, runs, ...(errors.length ? { errors, exitCode: 2 } : {}) };
+}
+
+const SKILL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const BRIEF_ROLES = {
+  planner: { label: '拆分', anchor: 'planner' },
+  coder: { label: '开发', anchor: 'coder' },
+  selfReviewer: { label: '自审', anchor: 'self-reviewer', guarded: true },
+  finalReviewer: { label: '终审', anchor: 'final-reviewer', guarded: true },
+  acceptor: { label: '验收者', anchor: 'acceptor', guarded: true },
+};
+
+function briefRef(run, raw, kind, registered) {
+  const key = `--${kind}`;
+  const ref = parseDepRef(/^\d+$/.test(raw) ? `#${raw}` : raw, null, run.forge, kind);
+  if (!ref || !Number.isSafeInteger(ref.id)) throw new CliError(kind === 'issue' ? 'INVALID_ISSUE' : 'INVALID_CHANGE', `${key} 须为编号、带仓库的引用或完整链接`);
+  const hub = run.hubRepo?.repo;
+  const known = registered.filter((item) => Number(issueNumber(item?.id ?? item)) === ref.id).map((item) => item?.repo ?? hub);
+  const repos = known.length ? known : [hub, ...(run.repos ?? []).map(({ repo }) => repo)];
+  const unique = new Map(repos.filter(Boolean).map((repo) => [repo.toLowerCase(), repo]));
+  const repo = ref.repo ?? (unique.size === 1 ? unique.values().next().value : null);
+  if (!repo) throw new CliError('AMBIGUOUS_REF', `${key} ${raw} 无法确定所属仓库，请传带仓库的引用或完整链接`);
+  const url = forgeRecordUrl(run, { repo, id: ref.id, kind });
+  if (ref.forge !== run.forge || (ref.host && ref.host !== new URL(url).host.toLowerCase())) {
+    throw new CliError('FORGE_NOT_IN_RUN', `${key} 的 Forge 与需求运行态不一致`);
+  }
+  return { repo, id: ref.id, url };
+}
+
+function fetchBaselineSha(repoPath, baselineBranch) {
+  const dir = repoPath && baselineBranch ? path.resolve(expandHome(repoPath)) : null;
+  if (!dir || !fs.existsSync(dir)) return '未取到';
+  const opts = { encoding: 'utf8', timeout: 15_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } };
+  const fetched = spawnSync('git', ['-C', dir, 'fetch', '--no-tags', 'origin', `+refs/heads/${baselineBranch}:refs/remotes/origin/${baselineBranch}`], opts);
+  if (fetched.status !== 0) return '未取到';
+  const rev = spawnSync('git', ['-C', dir, 'rev-parse', '--verify', `refs/remotes/origin/${baselineBranch}`], opts);
+  const sha = (rev.stdout ?? '').trim();
+  return rev.status === 0 && FULL_SHA.test(sha) ? sha : '未取到';
+}
+
+function cmdBrief(flags) {
+  const runArg = requireFlag(flags, 'run');
+  const role = requireFlag(flags, 'role');
+  const issue = requireFlag(flags, 'issue');
+  const roleMeta = BRIEF_ROLES[role];
+  if (!roleMeta) throw new CliError('INVALID_ROLE', `--role 必须是 ${Object.keys(BRIEF_ROLES).join('|')}，收到：${role}`);
+
+  if (!runArg.endsWith('.json')) throw new CliError('INVALID_RUN', '--run 必须指向需求运行态 JSON');
+  const runPath = path.resolve(expandHome(runArg));
+  const run = readJson(runPath, 'RUN_NOT_FOUND');
+  const ledgerRefs = (run.ledgers ?? []).map(({ key }) => boundLedger(run, key));
+  const issueRef = briefRef(run, issue, 'issue', [...registeredDemandIssues(run), ...Object.values(run.issues ?? {}), ...ledgerRefs]);
+  const changeArg = optFlag(flags, 'change');
+  const reviews = changeArg ? readReviews(runPath) : [];
+  const changeRef = changeArg ? briefRef(run, changeArg, 'change', [...(run.changes ?? []), ...reviews.map(({ pr }) => pr)]) : null;
+  const rejectCount = changeRef ? resolveReviewState(reviewsFor(reviews, changeRef), [], null).rejectCount : 0;
+
+  const models = run.roleModels ?? {};
+  const coderModel = normModel(models.coder);
+  const escalationModel = normModel(models.coderEscalation);
+  const escalated = Boolean(changeRef && rejectCount >= 1 && escalationModel);
+
+  let modelLine;
+  if (role === 'coder') {
+    modelLine = escalated
+      ? `${escalationModel}（升档：变更单已打回 ${rejectCount} 次，由 ${coderModel || '未配置'} 升档至 coderEscalation）`
+      : (coderModel || '未配置');
+  } else {
+    const roleModel = normModel(models[role]);
+    const conflict = roleMeta.guarded && roleModel
+      ? (sameModel(roleModel, coderModel) ? ['开发模型（coder）', coderModel]
+        : (escalated || role === 'acceptor') && sameModel(roleModel, escalationModel) ? ['升档开发模型（coderEscalation）', escalationModel] : null)
+      : null;
+    if (conflict) {
+      throw new CliError('SAME_MODEL_AS_CODER', `${roleMeta.label}（${role}）模型 ${roleModel} 与${conflict[0]}相同`, {
+        role, model: roleModel, coderModel: conflict[1], escalated,
+      });
+    }
+    modelLine = roleModel || '未配置';
+  }
+
+  const repo = changeRef?.repo ?? issueRef.repo;
+  const entry = (run.repos ?? []).find((item) => item.repo?.toLowerCase() === repo.toLowerCase())
+    ?? (run.hubRepo?.repo?.toLowerCase() === repo.toLowerCase() ? run.hubRepo : null);
+  const baseline = run.baselineBranch ?? run.branch ?? null;
+
+  return [
+    `开工前先读 ${path.join(SKILL_ROOT, 'references', 'roles.md')}#${roleMeta.anchor}`,
+    `需求：${run.req ?? '未配置'}`,
+    `子 Issue：#${issueRef.id}（${issueRef.url}）`,
+    ...(changeRef ? [`变更单：${changeRef.url}${rejectCount > 0 ? `（已打回 ${rejectCount} 次）` : ''}`] : []),
+    `仓库：${repo}`,
+    `基线分支：${baseline ?? '未配置'}`,
+    `基线 SHA：${fetchBaselineSha(entry?.path, baseline)}`,
+    `角色：${roleMeta.label}（${role}）`,
+    `模型：${modelLine}`,
+    '项目有工程规范（AGENTS.md、CLAUDE.md、CONTRIBUTING 等）时以项目规范为准',
+  ].join('\n');
+}
 
 function usage() {
   return {
@@ -2665,22 +2912,27 @@ function usage() {
     name: SKILL_NAME,
     version: VERSION,
     commands: [
-      'doctor [--project <slug>] [--cwd <dir>]            # 只读 6 项环境体检，返回支持档位 L1/L2/L3',
+      'doctor [--project <slug>] [--cwd <dir>] [--hostname <host>]            # 只读 6 项环境体检，返回支持档位 L1/L2/L3',
       'ledger-lint (--body <text>|--file <path>) [--tier L1|L2|L3] [--kind personal|master] [--max-lines 80]',
-      'transition-check --input <json>                    # 状态流转 5 条红线守卫',
-      'status [--req <slug>] [--live] [--live-input <json>] # 只读查看配置状态、活动需求、实时健康视图与下一步口令',
+      'status [--req <slug>] [--json] [--live] [--live-input <json>] # 查看需求进展，--json 输出机器可读数据，配 --live 实查代码平台',
       'config-resolve --project <slug> [--tier L1|L2|L3] [--overrides <json>]',
-      'preview-init --req <slug> --project <slug> [--tier ..] [--stage P0..P3] [--repos a,b] [--branch <br>] [--slots 主研发,A] [--overrides <json>]',
+      'preview-init --req <slug> --project <slug> [--tier ..] [--stage P0..P3] [--repos a,b] [--branch <br>] [--slots 主研发,A] [--slot <本机槽位>] [--overrides <json>]',
       'init --req <slug> --project <slug> [同 preview-init] [--issue-map <json>] [--session <id>] [--resume]',
+      'init --req <slug> --resume [--issue-map <json>] [--session <现任主控会话标识>]',
       'upgrade --req|--run <slug> --to L2|L3 [--slots a,b]            # 出计划，写 pendingUpgrade',
       'upgrade --req <slug> --to L2|L3 --apply [--issue-map <json>] [--results <json>]  # 逐项回执后落盘',
+      'tick --req <slug> --role controller|dispatch|patrol|lead-patrol [--apply] [--now <iso>] [--session <主控会话标识>]',
+      'merge-mode --req <slug> --manual|--auto',
+      'notify bind --req <slug> --chat <群名或chat_id> [--scope run|project]',
+      'notify unbind|mute|unmute --req <slug> [--scope run|project]',
+      'notify enqueue --req <slug> --kind daily|alert|contract-sync --dedup <key> --text <text> [--confirm-required]',
+      'notify confirm --req <slug> --id <id>',
+      'notify flush (--req <slug> | --all)',
       'wake-decision --input <json>   # 含 now/workHours/trigger 时非工作时段只心跳',
-      'eval-review --input <json> [--req <slug>]   # --req 时以 run 中 forge/基线/自动合并为准',
-      'eval-patrol --input <json>   # 大巡检日报入口：mode=lead、dailyReport=true（含个人临时规范探针）',
-      'slot-claim [--slot <槽位>] --input <json>',
-      'retro [--req <slug>] --input <json> [--force] [--feedback-repo <repo>]  # 条件触发纯机制复盘（纯只读）',
-      'teardown --req <slug> [--live <json>] [--force]      # 第 1 步：出清单，保留 run',
-      'teardown --req <slug> --finalize --results <json>    # 第 2 步：逐项核验后归档',
+      'slot-claim --req <slug> --slot <槽位> [--master <总台账 URL> --session <id>（首次加入）]',
+      'brief --run <run.json> --role planner|coder|selfReviewer|finalReviewer|acceptor --issue <编号或链接> [--change <PR/MR编号>]',
+      'teardown --req <slug> [--force]      # 第 1 步：出清单，保留 run',
+      'teardown --req <slug> --finalize --results <json> [--waive-acceptance <原因>]    # 第 2 步：逐项核验后归档',
     ],
     globalFlags: ['--config-dir <dir>（默认 ~/.config/dev-loop，测试必须隔离）'],
   };
@@ -2689,34 +2941,40 @@ function usage() {
 const COMMANDS = {
   doctor: (flags, configDir) => runDoctor(flags, configDir),
   'ledger-lint': (flags) => runLedgerLint(flags),
-  'transition-check': (flags) => runTransitionCheck(flags),
   status: cmdStatus,
   'config-resolve': cmdConfigResolve,
   'preview-init': cmdPreviewInit,
   init: cmdInit,
   upgrade: cmdUpgrade,
-  'wake-decision': cmdWakeDecision,
-  'eval-review': cmdEvalReview,
-  'eval-patrol': cmdEvalPatrol,
+  tick: cmdTick,
+  'merge-mode': cmdMergeMode,
+  notify: cmdNotify,
+  'wake-decision': (flags) => evalWakeDecision(parseJsonArg(flags.input, 'input')),
   'slot-claim': cmdSlotClaim,
-  retro: (flags, configDir) => runRetro(flags, configDir),
+  brief: cmdBrief,
   teardown: cmdTeardown,
 };
 
-function main(argv) {
-  const { flags, positional } = parseArgs(argv);
+function main(flags, positional) {
   const cmd = positional[0];
   if (!cmd || cmd === 'help' || flags.help) return usage();
   const handler = COMMANDS[cmd];
   if (!handler) throw new CliError('UNKNOWN_COMMAND', `未知子命令：${cmd}`, { commands: usage().commands });
-  return handler(flags, resolveConfigDir(flags));
+  return handler(flags, configPath(optFlag(flags, 'config-dir')), positional);
 }
 
+const { flags, positional } = parseArgs(process.argv.slice(2));
 try {
-  const { exitCode, ...payload } = main(process.argv.slice(2)) ?? {};
-  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
-  process.exitCode = Number(exitCode ?? 0);
+  const result = main(flags, positional);
+  if (typeof result === 'string') {
+    process.stdout.write(`${result}\n`);
+  } else if (result) {
+    const { exitCode, ...payload } = result;
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    process.exitCode = Number(exitCode ?? 0);
+  }
 } catch (err) {
-  process.stdout.write(`${JSON.stringify({ ok: false, code: err.code ?? 'UNEXPECTED_ERROR', message: err.message, ...(err.extra ?? {}) }, null, 2)}\n`);
+  if (positional[0] === 'status' && flags.json !== true) process.stderr.write(`${err.message}\n`);
+  else process.stdout.write(`${JSON.stringify({ ok: false, code: err.code ?? 'UNEXPECTED_ERROR', message: err.message, ...(err.extra ?? {}) }, null, 2)}\n`);
   process.exitCode = 2;
 }
