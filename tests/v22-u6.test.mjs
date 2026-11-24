@@ -355,7 +355,7 @@ try {
     assert.deepEqual(labelList(readState().prs[`${REPO}#10`]), [`需求:${run.req}`, '需修改']);
   });
 
-  test('「通过」省略 --must-fix 或带普通文本均不受影响', () => {
+  test('「通过」省略 --must-fix 或填「无」正常通过，带其他必改文本报 PASS_WITH_MUST_FIX', () => {
     const disp1 = setupDispatched('rev-pass-plain');
     const res1 = callVerdict(disp1, '通过');
     assert.equal(res1.code, 0, res1.stdout);
@@ -364,11 +364,15 @@ try {
     assert.match((readState().comments[noteKey] ?? [])[1]?.body ?? '', /必改项：\n无\n/);
 
     const disp2 = setupDispatched('rev-pass-with-note');
-    const res2 = callVerdict(disp2, '通过', ['--must-fix', '无阻断项，仅留线索']);
+    const resBad = callVerdict(disp2, '通过', ['--must-fix', '无阻断项，仅留线索']);
+    assert.equal(resBad.code, 2, resBad.stdout);
+    assert.equal(resBad.json.code, 'PASS_WITH_MUST_FIX');
+
+    const res2 = callVerdict(disp2, '通过', ['--must-fix', '无']);
     assert.equal(res2.code, 0, res2.stdout);
     assert.equal(res2.json.ok, true);
     assert.equal(res2.json.conclusion, '通过');
-    assert.match((readState().comments[noteKey] ?? [])[1]?.body ?? '', /必改项：\n无阻断项，仅留线索\n/);
+    assert.match((readState().comments[noteKey] ?? [])[1]?.body ?? '', /必改项：\n无\n/);
   });
 } finally {
   fs.rmSync(tmpDir, { recursive: true, force: true });

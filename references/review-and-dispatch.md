@@ -36,7 +36,7 @@ node scripts/forge.mjs verdict --run "$run_file" --dispatch-id "$dispatch_id" --
 
 命中的风险项填 `1`。六项依次是改契约或对外接口、改删公共热点或其他槽位文件的已有内容、表结构或存量数据迁移、改开关默认值或关闭时的存量逻辑、改其他槽位或关联仓使用的方法签名、改地基或公共构建配置。文件末尾追加需声明。按需要加 `--must-fix "$must_fix"`、`--remaining "$remaining"` 和 `--keep "$keep"`。
 
-用 `--conclusion 打回` 时须传 `--must-fix`。按行首编号或 `- ` 分条，每条须以 `【P0】`/`【P1】`/`【P2】`（也接受 `P0：` 等写法，脚本归一成 `【P0】`）开头并填实「入口：」和「证据：」，规则见 [终审角色](roles.md#final-reviewer)。字段缺失或仅有 Markdown 强调符时报 `MUST_FIX_INCOMPLETE`，缺等级报 `MUST_FIX_GRADE_MISSING`，熔断后必改项含 P2 报 `MUST_FIX_P2_AFTER_FUSE`，结论均不落地。「通过」结论可省略 `--must-fix`。通过与打回均可传 `--remaining` 登记遗留建议（可选，默认「无」）；遗留建议同样按条带等级、入口和证据，仅允许 P2，出现 P0/P1 报 `REMAINING_GRADE_TOO_HIGH`，不阻塞合入，只计入终审评论和归档指标。
+用 `--conclusion 打回` 时须传 `--must-fix`。按行首编号或 `- ` 分条，每条须以 `【P0】`/`【P1】`/`【P2】`（也接受 `P0：` 等写法，脚本归一成 `【P0】`）开头并填实「入口：」和「证据：」，规则见 [终审角色](roles.md#final-reviewer)。字段缺失或仅有 Markdown 强调符时报 `MUST_FIX_INCOMPLETE`，缺等级报 `MUST_FIX_GRADE_MISSING`，熔断后必改项含 P2 报 `MUST_FIX_P2_AFTER_FUSE`，结论均不落地。「通过」结论只能省略 `--must-fix` 或填「无」（否则报 `PASS_WITH_MUST_FIX`）。通过与打回均可传 `--remaining` 登记遗留建议（可选，默认「无」）；遗留建议同样按条带等级、入口和证据，仅允许 P2，出现 P0/P1 报 `REMAINING_GRADE_TOO_HIGH`，与必改项重复报 `DUPLICATE_REVIEW_ITEM`，不阻塞合入，只计入终审评论和归档指标。
 
 ```bash
 must_fix=$(cat <<'EOF'

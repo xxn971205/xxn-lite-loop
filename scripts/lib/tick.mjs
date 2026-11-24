@@ -816,7 +816,8 @@ function executeTick(runPath, role, apply, nowMs, lib, { findingsOnly = false, s
   const facts = collectRunFacts(run, { skipChangeComments(change) {
     const review = latest.get(issueRef(change));
     return isWaitingMerge(review, change)
-      || (review?.headSha === change.headSha && review.verdict?.body && !review.commentId);
+      || (review?.headSha === change.headSha && review.verdict?.body && !review.commentId
+        && !change.labels.some((label) => FORGE_REVIEW_LABELS.includes(label)));
   } });
   const personalTask = run.scheduledTasks?.find((task) => task.role === (role === 'patrol' ? 'patrol' : 'controller'));
   const slot = run.slot ?? personalTask?.ledgerKey?.match(/^slot:(.+)$/)?.[1] ?? '主研发';

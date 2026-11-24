@@ -44,25 +44,36 @@ if (args[0] === 'api') {
   const p = pos[0].split('?')[0];
   if (/^repos\\/[^/]+\\/[^/]+\\/issues\\/\\d+\\/comments$/.test(p)) {
     if (opt.method === 'POST') {
+      if (state.failVerdictPost && p.endsWith('/10/comments') && JSON.parse(stdin).body.includes('liteloop:verdict')) {
+        fail('HTTP 503 verdict publish');
+      }
       const notes = (state.comments[p] ??= []);
       const note = { id: notes.length + 100, body: JSON.parse(stdin).body, created_at: '2026-11-24T04:00:00Z' };
       notes.push(note);
       save();
       reply(note);
     }
+    if (state.failReads && p.endsWith('/10/comments')) fail('HTTP 503 fixture');
     reply(state.comments[p] ?? []);
   }
   if (/^repos\\/[^/]+\\/[^/]+\\/issues$/.test(p)) {
-    reply(Object.entries(state.issues).map(([k, v]) => ({ ...v, number: Number(k.split('#')[1]) })));
+    reply([
+      ...Object.entries(state.issues).map(([k, v]) => ({ ...v, number: Number(k.split('#')[1]) })),
+      ...Object.entries(state.prs).map(([k, v]) => ({ ...v, number: Number(k.split('#')[1]), pull_request: {} })),
+    ]);
   }
   if (/^repos\\/[^/]+\\/[^/]+\\/branches\\//.test(p)) {
     reply({ commit: { sha: '${HEAD_SHA}' } });
   }
   fail('unknown api ' + p);
 }
-if (args[0] === 'issue' && args[1] === 'view') {
+if (args[0] === 'issue' && ['view', 'edit'].includes(args[1])) {
   const issue = state.issues[repoArg() + '#' + args[2]];
   if (!issue) fail('not found');
+  if (args[1] === 'edit' && args.includes('--body')) {
+    issue.body = args[args.indexOf('--body') + 1];
+    save();
+  }
   reply(issue);
 }
 if (args[0] === 'pr' && args[1] === 'view') {
@@ -131,7 +142,7 @@ function createFixture(t, { autoMerge = true, thresholds } = {}) {
         number: 7,
         title: '【追踪】v23-demo',
         state: 'OPEN',
-        body: '## 1. 当前状态\n主控：第 1 任 ｜ ctrl-1\n## 3. 当前进行中\n办理 #15\n',
+        body: '## 1. 当前状态\n主控：第 1 任 ｜ ctrl-1\n本轮：空闲\n## 3. 当前进行中\n办理 #15\n',
         labels: [{ name: `需求:${req}` }],
         updatedAt: '2026-11-24T00:00:00Z',
         url: `https://github.com/${REPO}/issues/7`,
@@ -154,6 +165,7 @@ function createFixture(t, { autoMerge = true, thresholds } = {}) {
         headRefName: 'feat/v23',
         baseRefName: BASELINE,
         body: '关联 #15',
+        updatedAt: '2026-11-24T04:00:00Z',
         labels: [{ name: '待终审' }, { name: `需求:${req}` }],
       },
     },
@@ -213,11 +225,24 @@ function createFixture(t, { autoMerge = true, thresholds } = {}) {
   ]);
 
   const loopctl = (args) => runCli(LOOPCTL, [...args, '--config-dir', configDir]);
+  const tickDispatch = (apply = false) => {
+    const res = loopctl(['tick', '--req', req, '--role', 'controller', '--now', '2026-11-24T05:00:00Z', ...(apply ? ['--apply'] : [])]);
+    assert.equal(res.code, 0, res.stdout + res.stderr);
+    const actions = res.json.runs?.[0]?.actions ?? [];
+    const action = actions.find((item) => item.kind === 'review-dispatch' && item.code === 'dispatch');
+    assert.ok(action, `missing review-dispatch action: ${JSON.stringify(actions)}`);
+    return action;
+  };
+  const snapshot = () => ({
+    journal: fs.existsSync(journalPath) ? fs.readFileSync(journalPath, 'utf8') : '',
+    comments: comments(),
+    labels: labels(),
+  });
 
   return {
-    req, runPath, journalPath, configDir,
+    req, runPath, journalPath, configDir, noteKey,
     readState, writeState, readCalls, clearCalls, readJournal, labels, comments,
-    requeue, dispatch, verdict, loopctl,
+    requeue, dispatch, verdict, loopctl, tickDispatch, snapshot,
   };
 }
 
@@ -433,6 +458,10 @@ test('AC6：归档时 teardown.metrics.grades 汇总准确且完结评论含分�
     type: 'merge-result', dispatchId: 'd-new-2', state: 'manual', code: 'REJECT_FUSE_FULL_REVIEW',
   });
 
+  const s1Open = f1.readState();
+  s1Open.prs[`${REPO}#10`].state = 'MERGED';
+  s1Open.issues[`${REPO}#15`].state = 'CLOSED';
+  f1.writeState(s1Open);
   const plan1 = f1.loopctl(['teardown', '--req', f1.req]);
   assert.equal(plan1.code, 0, plan1.stdout + plan1.stderr);
   assert.match(plan1.json.closingComments[0].body, /终审记录：1 个变更单 \/ 累计打回 2 次 \/ 分级合计 P0 1 · P1 2 · P2 3/);
@@ -456,6 +485,10 @@ test('AC6：归档时 teardown.metrics.grades 汇总准确且完结评论含分�
     headSha: HEAD_SHA, session: 'legacy-r1', nonce: 'n1', at: '2026-11-24T01:00:00Z',
   });
   appendReview(f2.runPath, { type: 'verdict', dispatchId: 'legacy-1', conclusion: '打回', risk: LOW_RISK });
+  const s2Open = f2.readState();
+  s2Open.prs[`${REPO}#10`].state = 'MERGED';
+  s2Open.issues[`${REPO}#15`].state = 'CLOSED';
+  f2.writeState(s2Open);
   const plan2 = f2.loopctl(['teardown', '--req', f2.req]);
   assert.equal(plan2.code, 0, plan2.stdout + plan2.stderr);
   assert.match(plan2.json.closingComments[0].body, /分级合计 P0 0 · P1 0 · P2 0/);
@@ -499,4 +532,225 @@ test('边界补充：非熔断通过带 P2 遗留建议不阻塞自动合入；�
 
   const loopHelp = spawnSync(process.execPath, [LOOPCTL, '--help'], { encoding: 'utf8', env: BASE_ENV });
   assert.equal(JSON.parse(loopHelp.stdout).version, '2.3.0');
+});
+
+test('回归 1A：派审后恢复前轮旧 Forge 评论，本轮仍按派审时口径放行 P2 打回', (t) => {
+  const f = createFixture(t);
+  const p1 = '1. 【P1】负数库存校验错误\n   入口：POST /orders\n   证据：create.ts:18 复现';
+  const p2 = '1. 【P2】列表空态文案不清\n   入口：GET /orders\n   证据：list.ts:18 统一返回空态';
+
+  const d1 = f.dispatch('r1');
+  assert.equal(f.verdict(d1, '打回', ['--must-fix', p1]).json.code, 'REVIEW_REJECTED');
+  f.requeue();
+
+  const state = f.readState();
+  state.comments[f.noteKey].push({
+    id: 888,
+    created_at: '2026-11-24T04:05:00Z',
+    body: `主控 ｜ A ｜ ctrl-1\n已派终审：第 2 轮 ｜ 会话标识：historical-r2 ｜ head SHA：${HEAD_SHA} ｜ 派审 ID：remote-2`,
+  });
+  f.writeState(state);
+
+  const plan = f.tickDispatch();
+  const d2 = f.dispatch('new-reviewer');
+  const persistedRejects = readReviews(f.runPath).at(-1).rejectDispatchIds.length;
+  assert.deepEqual([plan.rejectCount, plan.fullReReview], [1, false]);
+  assert.deepEqual([d2.rejectCount, d2.fullReReview, persistedRejects], [1, false, 1]);
+
+  // 派审完成后才在 Forge 上恢复一条前轮旧打回评论；本轮收窄必须仍按派审登记口径（1 次，未熔断）判定
+  const restored = f.readState();
+  restored.comments[f.noteKey].push({
+    id: 903,
+    created_at: '2026-11-24T04:40:00Z',
+    body: `终审 ｜ A ｜ historical-r2\n结论：打回（第 2 轮）\n<!-- liteloop:verdict ${JSON.stringify({
+      dispatchId: 'remote-2', round: 2, conclusion: '打回', risk: LOW_RISK, headSha: HEAD_SHA, session: 'historical-r2',
+    })} -->`,
+  });
+  f.writeState(restored);
+
+  const res = f.verdict(d2, '打回', ['--must-fix', p2]);
+  assert.equal(res.code, 0, res.stdout);
+  assert.equal(res.json.code, 'REVIEW_REJECTED');
+});
+
+test('回归 1B：上一轮结论待补发时，tick 派审动作、派审登记与结论收窄三处口径一致', (t) => {
+  const f = createFixture(t);
+  const p1 = '1. 【P1】负数库存校验错误\n   入口：POST /orders\n   证据：create.ts:18 复现';
+  const p2 = '1. 【P2】列表空态文案不清\n   入口：GET /orders\n   证据：list.ts:18 统一返回空态';
+
+  const s0 = f.readState();
+  s0.comments[f.noteKey] = [{
+    id: 888,
+    created_at: '2026-11-24T04:05:00Z',
+    body: `主控 ｜ A ｜ ctrl-1\n已派终审：第 1 轮 ｜ 会话标识：historical-r1 ｜ head SHA：${HEAD_SHA} ｜ 派审 ID：remote-old`,
+  }];
+  f.writeState(s0);
+
+  const d1 = f.dispatch('local-audit-pending');
+  const s1 = f.readState();
+  s1.failVerdictPost = true;
+  s1.comments[f.noteKey].push({
+    id: 902,
+    created_at: '2026-11-24T04:10:00Z',
+    body: `终审 ｜ A ｜ historical-r1\n结论：打回（第 1 轮）\n<!-- liteloop:verdict ${JSON.stringify({
+      dispatchId: 'remote-old', round: 1, conclusion: '打回', risk: LOW_RISK, headSha: HEAD_SHA, session: 'historical-r1',
+    })} -->`,
+  });
+  f.writeState(s1);
+
+  const r1 = f.verdict(d1, '打回', ['--must-fix', p1]);
+  assert.equal(r1.code, 0, r1.stdout);
+  assert.equal(r1.json.auditPending, true);
+  assert.equal(r1.json.rejectCount, 2);
+
+  f.requeue();
+  const plan = f.tickDispatch();
+  const d2 = f.dispatch('planned-fused');
+  const recorded = readReviews(f.runPath).at(-1).rejectDispatchIds.length;
+  const before = f.snapshot();
+  const blocked = f.verdict(d2, '打回', ['--must-fix', p2]);
+
+  assert.deepEqual([plan.rejectCount, plan.fullReReview], [2, true]);
+  assert.deepEqual([d2.rejectCount, d2.fullReReview, recorded], [2, true, 2]);
+  assert.equal(blocked.code, 2, blocked.stdout);
+  assert.equal(blocked.json.code, 'MUST_FIX_P2_AFTER_FUSE');
+  assert.equal(blocked.json.rejectCount, 2);
+  assert.deepEqual(f.snapshot(), before);
+});
+
+test('回归 2：「通过」附带 P0 必改项报 PASS_WITH_MUST_FIX 且零副作用，填「无」仍可通过', (t) => {
+  const f = createFixture(t, { autoMerge: true });
+  const d = f.dispatch('pass-with-p0');
+  const before = f.snapshot();
+
+  const res = f.verdict(d, '通过', [
+    '--must-fix', '1. 【P0】负数库存校验错误\n   入口：POST /orders\n   证据：create.ts:18 复现',
+  ]);
+  assert.equal(res.code, 2, res.stdout);
+  assert.equal(res.json.ok, false);
+  assert.equal(res.json.code, 'PASS_WITH_MUST_FIX');
+  assert.match(res.json.message, /--remaining/);
+  assert.equal(f.readCalls().length, 0);
+  assert.equal(f.readState().prs[`${REPO}#10`].state, 'OPEN');
+  assert.deepEqual(f.snapshot(), before);
+
+  const ok = f.verdict(d, '通过', ['--must-fix', '无']);
+  assert.equal(ok.code, 0, ok.stdout);
+  assert.equal(ok.json.code, 'LOW_RISK_AUTO_MERGE');
+});
+
+test('回归 3：归一化仅替换等级标记与明确分隔符，完整保留正文负号与 Markdown 符号', (t) => {
+  const f = createFixture(t);
+  const d = f.dispatch('preserve-body');
+  const mustFix = [
+    '1. 【P1】-1 被错误当作有效库存',
+    '   入口：POST /orders',
+    '   证据：create.ts:18 复现',
+    '2. P1：**空列表返回 500**',
+    '   入口：POST /orders',
+    '   证据：create.ts:25 复现',
+    '3. **P0**：-0.5 金额被截断为 0',
+    '   入口：POST /pay',
+    '   证据：pay.ts:12 复现',
+  ].join('\n');
+
+  const res = f.verdict(d, '打回', ['--must-fix', mustFix]);
+  assert.equal(res.code, 0, res.stdout);
+  const body = f.comments().at(-1).body;
+  assert.ok(body.includes('1. 【P1】-1 被错误当作有效库存'), body);
+  assert.ok(body.includes('2. 【P1】**空列表返回 500**'), body);
+  assert.ok(body.includes('3. 【P0】-0.5 金额被截断为 0'), body);
+});
+
+test('回归 4：必改项与遗留建议含归一后重复条目报 DUPLICATE_REVIEW_ITEM 且零副作用', (t) => {
+  const f = createFixture(t);
+  const d = f.dispatch('dup-finding');
+  const before = f.snapshot();
+
+  const res = f.verdict(d, '打回', [
+    '--must-fix', [
+      '1. 【P1】下单数量未校验',
+      '   入口：POST /orders',
+      '   证据：create.ts:10 复现',
+      '2. 【P2】列表空态文案不清',
+      '   入口：GET /orders',
+      '   证据：list.ts:18 统一渲染暂无数据',
+    ].join('\n'),
+    '--remaining', '1. P2：列表空态文案不清\n   入口：GET /orders\n   证据：list.ts:18 统一渲染暂无数据',
+  ]);
+
+  assert.equal(res.code, 2, res.stdout);
+  assert.equal(res.json.ok, false);
+  assert.equal(res.json.code, 'DUPLICATE_REVIEW_ITEM');
+  assert.match(res.json.message, /只保留一处/);
+  assert.equal(f.readCalls().length, 0);
+  assert.deepEqual(f.snapshot(), before);
+});
+
+test('E2E：GitHub L2 三轮派审（P2→P1→tick 全量重审→熔断拒 P2→同派审改通过交人）并拆架归档', (t) => {
+  const f = createFixture(t, { autoMerge: true });
+  const p2 = '1. 【P2】列表空态文案不清\n   入口：GET /orders\n   证据：list.ts:18 空态不区分原因';
+  const p1 = '1. 【P1】负数库存校验错误\n   入口：POST /orders\n   证据：create.ts:18 复现';
+
+  // 第 1 轮：打回，含 P2
+  const plan1 = f.tickDispatch(true);
+  assert.deepEqual([plan1.rejectCount, plan1.fullReReview], [0, false]);
+  const d1 = f.dispatch('e2e-r1');
+  assert.equal(d1.round, 1);
+  const r1 = f.verdict(d1, '打回', ['--must-fix', p2]);
+  assert.equal(r1.code, 0, r1.stdout);
+  assert.equal(r1.json.code, 'REVIEW_REJECTED');
+  f.requeue();
+
+  // 第 2 轮：打回，含 P1
+  const plan2 = f.tickDispatch(true);
+  assert.deepEqual([plan2.rejectCount, plan2.fullReReview], [1, false]);
+  const d2 = f.dispatch('e2e-r2');
+  assert.equal(d2.round, 2);
+  const r2 = f.verdict(d2, '打回', ['--must-fix', p1]);
+  assert.equal(r2.code, 0, r2.stdout);
+  assert.equal(r2.json.code, 'REVIEW_REJECTED');
+  f.requeue();
+
+  // 第 3 轮：真实 tick --apply 产出 fullReReview: true，按此动作派审
+  const plan3 = f.tickDispatch(true);
+  assert.deepEqual([plan3.rejectCount, plan3.fullReReview], [2, true]);
+  const d3 = f.dispatch('e2e-r3');
+  assert.deepEqual([d3.round, d3.rejectCount, d3.fullReReview], [3, 2, true]);
+
+  // 提交含 P2 的打回被拒，且零副作用
+  const before = f.snapshot();
+  const blocked = f.verdict(d3, '打回', ['--must-fix', p2]);
+  assert.equal(blocked.code, 2, blocked.stdout);
+  assert.equal(blocked.json.code, 'MUST_FIX_P2_AFTER_FUSE');
+  assert.deepEqual(f.snapshot(), before);
+  assert.ok(f.readCalls().every(({ args }) => !args.includes('POST') && args[1] !== 'edit' && args[1] !== 'merge'));
+
+  // 同一派审改「通过」，P2 放进遗留建议，交人裁决
+  const passed = f.verdict(d3, '通过', ['--remaining', p2]);
+  assert.equal(passed.code, 0, passed.stdout);
+  assert.equal(passed.json.state, 'manual');
+  assert.equal(passed.json.code, 'REJECT_FUSE_FULL_REVIEW');
+  assert.equal(f.readState().prs[`${REPO}#10`].state, 'OPEN');
+  assert.deepEqual(f.labels(), [`需求:${f.req}`, '待合并']);
+  const note3 = f.comments().findLast((n) => n.body.includes('liteloop:verdict'));
+  assert.deepEqual(parseVerdictMeta(note3.body).grades, { p0: 0, p1: 0, p2: 1 });
+
+  // 人工合入后用同一份运行日志拆架归档，验证 metrics.grades = {p0:0, p1:1, p2:2}
+  const sDone = f.readState();
+  sDone.prs[`${REPO}#10`].state = 'MERGED';
+  sDone.issues[`${REPO}#15`].state = 'CLOSED';
+  f.writeState(sDone);
+  const tdPlan = f.loopctl(['teardown', '--req', f.req]);
+  assert.equal(tdPlan.code, 0, tdPlan.stdout + tdPlan.stderr);
+  assert.match(tdPlan.json.closingComments[0].body, /分级合计 P0 0 · P1 1 · P2 2/);
+
+  const sClosed = f.readState();
+  sClosed.issues[`${REPO}#7`].state = 'CLOSED';
+  f.writeState(sClosed);
+  const tdFinal = f.loopctl(['teardown', '--req', f.req, '--finalize', '--results', '{}']);
+  assert.equal(tdFinal.code, 0, tdFinal.stdout + tdFinal.stderr);
+  assert.deepEqual(tdFinal.json.metrics.grades, { p0: 0, p1: 1, p2: 2 });
+  const archived = JSON.parse(fs.readFileSync(tdFinal.json.archivePath, 'utf8'));
+  assert.deepEqual(archived.teardown.metrics.grades, { p0: 0, p1: 1, p2: 2 });
 });

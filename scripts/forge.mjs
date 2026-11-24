@@ -566,7 +566,10 @@ function dispatchReview(ctx, flags) {
       `已派终审：第 ${round} 轮 ｜ 会话标识：${session} ｜ head SHA：${headSha} ｜ 派审 ID：${dispatchId}`,
     ].join('\n'));
     emitReal(changeLabel(ctx, { ...pr, add: '终审中', remove: '待终审' }));
-    return { ok: true, dispatchId, round, headSha, session, nonce };
+    return {
+      ok: true, dispatchId, round, headSha, session, nonce,
+      rejectCount: review.rejectCount, fullReReview: review.rejectCount >= (run.thresholds?.rejectFuseCount ?? 2),
+    };
   });
 }
 
@@ -584,7 +587,7 @@ function verdictRisk(value) {
   return risk;
 }
 
-const GRADE_PREFIX = /^((?:\d+(?:\.(?!\d)|[、)）])|-[ \t])[ \t]*)?(?:[*_]{1,2})?(?:【(P[012])】|\[(P[012])\]|(P[012])(?=(?:[*_]{1,2})?[：:\s\-—]))(?:[*_]{1,2})?(?:[ \t]*[：:\-—][ \t]*|[ \t]+)?(?:[*_]{1,2})?[ \t]*/i;
+const GRADE_PREFIX = /^((?:\d+(?:\.(?!\d)|[、)）])|-[ \t])[ \t]*)?(?:(\*{1,2}|_{1,2})(?:【(P[012])】|\[(P[012])\]|(P[012])[：:]?)\2(?:[ \t]*[：:][ \t]*|[ \t]+)?|(?:【(P[012])】|\[(P[012])\])(?:[ \t]*[：:][ \t]*|[ \t]+)?|(P[012])(?:[：:][ \t]*|[ \t]+(?:[-—][ \t]+)?|(?=\n)))/i;
 
 function parseReviewItems(text, label = '必改项') {
   const lines = String(text).split(/\r\n?|\n/);
@@ -609,9 +612,11 @@ function parseReviewItems(text, label = '必改项') {
       missingGrade.push({ index: idx + 1, item: short });
       return;
     }
-    const grade = (match[2] ?? match[3] ?? match[4]).toLowerCase();
+    const grade = match.slice(3).find(Boolean).toLowerCase();
     grades[grade] += 1;
-    parsed.push({ index: idx + 1, item: short, grade, text: `${match[1] ?? ''}【${grade.toUpperCase()}】${item.slice(match[0].length)}` });
+    const normalizedBody = `【${grade.toUpperCase()}】${item.slice(match[0].length)}`;
+    const key = normalizedBody.split('\n').map((line) => line.trim()).filter(Boolean).join('\n');
+    parsed.push({ index: idx + 1, item: short, grade, key, text: `${match[1] ?? ''}${normalizedBody}` });
   });
   if (!items.length || incomplete.length) {
     const detail = incomplete.map(({ index, item, missing }) => `第 ${index} 条（${item}）缺${missing.join('、')}`).join('；');
@@ -660,8 +665,11 @@ function changeVerdict(ctx, flags) {
   const reviewText = (key, needed = false) => !needed && flags[key] === undefined ? '无'
     : required(flags, key).replace(/<!--(?=\s*liteloop:verdict\b)/g, '&lt;!--').replaceAll(nonce, '[已隐藏]');
   const rawMustFix = reviewText('must-fix', conclusion === '打回');
+  if (conclusion === '通过' && rawMustFix.trim() !== '无') {
+    throw new CliError('PASS_WITH_MUST_FIX', '结论为「通过」时 --must-fix 只能省略或填「无」；P2 遗留建议请放进 --remaining，有 P0/P1 请改为「打回」');
+  }
   const mustFixParsed = conclusion === '打回' ? parseReviewItems(rawMustFix, '必改项') : null;
-  const mustFix = mustFixParsed ? mustFixParsed.text : rawMustFix;
+  const mustFix = mustFixParsed ? mustFixParsed.text : '无';
   const rawRemaining = reviewText('remaining');
   const remainingParsed = rawRemaining.trim() === '无' ? null : parseReviewItems(rawRemaining, '遗留建议');
   if (remainingParsed && (remainingParsed.grades.p0 > 0 || remainingParsed.grades.p1 > 0)) {
@@ -670,6 +678,16 @@ function changeVerdict(ctx, flags) {
     throw new CliError('REMAINING_GRADE_TOO_HIGH', `遗留建议仅允许 P2，P0/P1 必须打回：${detail}`, {
       items: high.map(({ index, item, grade }) => ({ index, item, grade: grade.toUpperCase() })),
     });
+  }
+  if (mustFixParsed && remainingParsed) {
+    const mustFixKeys = new Set(mustFixParsed.items.map(({ key }) => key));
+    const duplicates = remainingParsed.items.filter(({ key }) => mustFixKeys.has(key));
+    if (duplicates.length) {
+      const detail = duplicates.map(({ index, item }) => `第 ${index} 条（${item}）`).join('；');
+      throw new CliError('DUPLICATE_REVIEW_ITEM', `同一条目不能同时出现在必改项和遗留建议中，请只保留一处：${detail}`, {
+        items: duplicates.map(({ index, item }) => ({ index, item })),
+      });
+    }
   }
   const remaining = remainingParsed ? remainingParsed.text : '无';
   const grades = {
@@ -705,13 +723,9 @@ function changeVerdict(ctx, flags) {
     const member = !changeMembership(run, live);
     if (mustFixParsed?.grades.p2 > 0) {
       const fuseCount = run.thresholds?.rejectFuseCount ?? 2;
-      let priorRejects = resolveReviewState(history, [], headSha).rejectCount;
-      if (priorRejects < fuseCount && member) {
-        try {
-          const priorNotes = readComments(ctx, commentsEndpoint(ctx, 'change', pr.repo, pr.id));
-          priorRejects = resolveReviewState(history, priorNotes, headSha).rejectCount;
-        } catch { /* Fall back to local reject history. */ }
-      }
+      const priorRejects = Array.isArray(dispatch.rejectDispatchIds)
+        ? dispatch.rejectDispatchIds.length
+        : resolveReviewState(history, [], headSha).rejectCount;
       if (priorRejects >= fuseCount) {
         const p2Items = mustFixParsed.items.filter(({ grade }) => grade === 'p2');
         const detail = p2Items.map(({ index, item }) => `第 ${index} 条（${item}）`).join('；');
