@@ -14,7 +14,7 @@ bash install.sh --with-hooks
 
 新开 AI 会话。首次运行会一次问四个问题并自动写本机档案。开始时核对确认单上的仓库、验证命令、模型和合入方式，回复「确认」。
 
-升级到 v2.2 时，已有 `local-test` 工程档案需在 `verification.commands` 补上各仓试合命令，或用 `verification.skipReason` 写明跳过原因，否则启动新需求会报 `MISSING_VERIFICATION`。试合命令在全新检出里运行，需自行安装验证依赖。 [工程档案示例](references/lifecycle.md#projectsdemoyaml)
+升级到 v2.2 时，已有 `local-test` 工程档案需在 `verification.commands` 补上各仓试合命令，或用 `verification.skipReason` 写明跳过原因，否则启动新需求会报 `MISSING_VERIFICATION`。试合命令在全新检出里运行，需自行安装验证依赖。 [工程档案示例](references/lifecycle.md#projectsdemoyaml) 升级到 v2.3 起，终审打回的必改项必须标明等级（`【P0】`/`【P1】`/`【P2】`），熔断后只就 P0、P1 打回，P2 改写到 `--remaining` 遗留建议。
 
 | 想做什么 | 对 AI 说 |
 | --- | --- |
