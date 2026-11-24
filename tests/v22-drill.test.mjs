@@ -325,3 +325,12 @@ test('高风险合并结果评论只说明一次人工合入，并保留试合�
   assert.doesNotMatch(body, /请人工处理/);
   assert.ok(body.includes(`合并前试合：true 通过（base ${f.baseSha.slice(0, 8)}）`), body);
 });
+
+test('status 在没有进行中的需求时正常输出', (t) => {
+  const f = fixture(t);
+  const bin = fileURLToPath(new URL('../scripts/loopctl.mjs', import.meta.url));
+  for (const extra of [[], ['--live']]) {
+    const stdout = execFileSync(process.execPath, [bin, 'status', ...extra], { env: f.env, encoding: 'utf8' });
+    assert.match(stdout, /当前没有进行中的需求|本机尚未完成初始配置/, stdout);
+  }
+});

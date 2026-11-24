@@ -68,7 +68,7 @@ export function formatStatus(status, run, today = new Date()) {
   const tier = run?.tier ?? '未登记';
   const baseline = run?.baselineBranch ?? run?.branch ?? '未登记';
   const collaborator = tier === 'L3' && dispatchSlot(run) !== '主研发';
-  const mergeMode = collaborator && !archived
+  const mergeMode = !run ? null : collaborator && !archived
     ? summary?.autoMerge == null ? '等待从总台账核实' : describeMergeMode({ ...run, autoMerge: summary.autoMerge })
     : describeMergeMode(run);
   const otherRuns = (status.activeRuns?.length ?? 1) - 1;
