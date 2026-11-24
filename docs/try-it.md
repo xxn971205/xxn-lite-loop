@@ -4,7 +4,7 @@
 
 ## 准备沙箱
 
-**你执行。** 需要 Node.js 20+、Git 和已登录的 `gh`。先把 `<你的账号>/<沙箱仓名>` 换成你自己的 GitHub 私有仓名后在终端运行下面命令，再用 AI 客户端打开输出的 `repo` 目录。若本机还没按 `README.md` 安装 v2.2，把 [SKILL.md](../SKILL.md) 发给 AI，让它从同一份 LiteLoop 检出的 `scripts/` 运行命令。
+**你执行。** 需要 Node.js 20+、Git 和已登录的 `gh`。先把 `<你的账号>/<沙箱仓名>` 换成你自己的 GitHub 私有仓名后在终端运行下面命令，再用 AI 客户端打开输出的 `repo` 目录。若本机还没按 `README.md` 安装 v2.3，把 [SKILL.md](../SKILL.md) 发给 AI，让它从同一份 LiteLoop 检出的 `scripts/` 运行命令。
 
 ```bash
 SANDBOX_REPO="<你的账号>/<沙箱仓名>"
