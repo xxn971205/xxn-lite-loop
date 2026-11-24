@@ -109,6 +109,15 @@ function dueReminders(snapshot, stateKey, items, hours) {
       sent.set(item.key, { sentAt: previousAt });
     }
   }
+  const failedRefs = [...(snapshot.failedCommentRefs ?? [])];
+  if (failedRefs.length) {
+    for (const [key, entry] of Object.entries(snapshot.previous[stateKey] ?? {})) {
+      if (sent.has(key) || key.startsWith('pending-merge:') || key.startsWith('pending-review:')) continue;
+      if (failedRefs.some((ref) => key.includes(`:${ref}@`) || key.includes(`:${ref}:`) || key.endsWith(`:${ref}`))) {
+        sent.set(key, entry);
+      }
+    }
+  }
   snapshot.next[stateKey] = Object.fromEntries(sent);
   return due;
 }
@@ -344,9 +353,9 @@ function planPatrolReview(snapshot, ledgers, issues, changes) {
     const before = previous[type]?.[key] ?? {};
     const info = { ...noteRef(item), kind: type === 'changes' ? 'change' : 'issue' };
     const masterContractOnly = role === 'patrol' && item.key === 'master';
-    const documents = masterContractOnly ? [] : documentLinks(item);
-    const maxCommentId = Math.max(before.maxCommentId ?? 0, 0, ...item.comments.map((note) => note.id));
-    const configComments = masterContractOnly ? [] : item.comments.filter((note) => note.id > (before.maxCommentId ?? 0) && note.prefix === '配置变更').map((note) => note.id);
+    const documents = masterContractOnly ? [] : item.commentError ? (before.documents ?? []) : documentLinks(item);
+    const maxCommentId = item.commentError ? (before.maxCommentId ?? 0) : Math.max(before.maxCommentId ?? 0, 0, ...item.comments.map((note) => note.id));
+    const configComments = masterContractOnly || item.commentError ? [] : item.comments.filter((note) => note.id > (before.maxCommentId ?? 0) && note.prefix === '配置变更').map((note) => note.id);
     const newDesignLinks = documents.filter((link) => !before.documents?.includes(link));
     const version = type === 'ledgers' ? contractVersion(item, lib) : null;
     const body = type !== 'ledgers' ? null : semanticBody(masterContractOnly
@@ -832,7 +841,10 @@ function executeTick(runPath, role, apply, nowMs, lib, { findingsOnly = false, s
     ] }] };
   }
   const actions = facts.errors.map(factError);
-  const reviewErrors = facts.changes.filter(({ commentError }) => commentError).map(({ commentError }) => factError(commentError));
+  const failedCommentChanges = facts.changes.filter(({ commentError }) => commentError);
+  const commentErrors = failedCommentChanges.map(({ commentError }) => factError(commentError));
+  const failedCommentRefs = new Set(failedCommentChanges.map(issueRef));
+  const reviewErrors = [];
   const win = lib.workWindow(run);
   const work = lib.windowAt(nowMs, win);
   const collaborator = run.tier === 'L3' && slot !== '主研发' && ['controller', 'patrol'].includes(role);
@@ -842,7 +854,8 @@ function executeTick(runPath, role, apply, nowMs, lib, { findingsOnly = false, s
     actions.push(action('membership-notice', warning.message, [noteRef(warning)], null,
       { code: warning.code, needsLlm: false }));
   }
-  const result = () => actions.length || reviewErrors.length ? { runs: [{ req: run.req, actions: [...actions, ...reviewErrors] }] } : null;
+  const result = () => actions.length || commentErrors.length || reviewErrors.length
+    ? { runs: [{ req: run.req, actions: [...actions, ...commentErrors, ...reviewErrors] }] } : null;
   const base = runPath.slice(0, -5);
   const statePath = (which) => `${base}.tick-state.${which}.json`;
   const loaded = readTickState(statePath(role), role, actions);
@@ -860,7 +873,7 @@ function executeTick(runPath, role, apply, nowMs, lib, { findingsOnly = false, s
   const offHours = !work.inside;
   const snapshot = {
     run, role, nowMs, localNow: work.now, offHours, win, ctx: { nowMs, win, offHours }, facts, master, personal, slot, ownIssues, ownChanges,
-    runPath, lib, thresholds, reviews, reviewErrors, baseline: run.baselineBranch ?? run.branch, previous, next, actions, effects: [], findings: [], decisions: [], fusedChanges: [],
+    runPath, lib, thresholds, reviews, reviewErrors, failedCommentRefs, baseline: run.baselineBranch ?? run.branch, previous, next, actions, effects: [], findings: [], decisions: [], fusedChanges: [],
     reviewEvents: new Map(), rejectedSources: new Set(), changeFiles: new Map(), ownership: [],
   };
   if (role === 'controller' && personal?.state === 'open') {

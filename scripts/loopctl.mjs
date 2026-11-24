@@ -2869,11 +2869,13 @@ function cmdBrief(flags) {
   const changeRef = changeArg ? briefRef(run, changeArg, 'change', [...(run.changes ?? []), ...reviews.map(({ pr }) => pr)]) : null;
   const changeReviews = changeRef ? reviewsFor(reviews, changeRef) : [];
   const activeDispatch = changeReviews.at(-1) && !changeReviews.at(-1).verdict ? changeReviews.at(-1) : null;
+  const reviewState = changeRef ? resolveReviewState(changeReviews, [], null) : null;
   const rejectCount = changeRef
     ? (Array.isArray(activeDispatch?.rejectDispatchIds)
       ? activeDispatch.rejectDispatchIds.length
-      : resolveReviewState(changeReviews, [], null).rejectCount)
+      : reviewState.rejectCount)
     : 0;
+  const dispatchRound = activeDispatch?.round ?? reviewState?.round ?? 1;
   const fuseCount = run.thresholds?.rejectFuseCount ?? 2;
   const fullReReview = Boolean(changeRef && rejectCount >= fuseCount);
 
@@ -2910,8 +2912,8 @@ function cmdBrief(flags) {
     ? (fullReReview
       ? `终审口径：已熔断（已打回 ${rejectCount} 次，fullReReview=true，全量复审）；仅允许就 P0/P1 打回，P2 只能写进 --remaining 遗留建议（只剩 P2 请给「通过」），通过后仍交人裁决`
       : rejectCount === 0
-        ? `终审口径：首轮深审（全单，熔断前，已打回 0 次，fullReReview=false）：P0/P1/P2 均可打回，问题尽量一次挖透；熔断后（累计打回 ≥ ${fuseCount} 次）P2 只能写进 --remaining 遗留建议`
-        : `终审口径：第 ${activeDispatch?.round ?? rejectCount + 1} 轮复审（熔断前，已打回 ${rejectCount} 次，fullReReview=false）：核上轮必改项与直接影响面，P0/P1/P2 均可打回，问题尽量一次挖透；熔断后（累计打回 ≥ ${fuseCount} 次）P2 只能写进 --remaining 遗留建议`)
+        ? `终审口径：尚未打回（第 ${dispatchRound} 次派审，fullReReview=false）：全单深审，P0/P1/P2 均可打回，问题尽量一次挖透；熔断后（累计打回 ≥ ${fuseCount} 次）P2 只能写进 --remaining 遗留建议`
+        : `终审口径：已打回 ${rejectCount} 次、未熔断（fullReReview=false）：核上轮必改项与直接影响面，P0/P1/P2 均可打回，问题尽量一次挖透；熔断后（累计打回 ≥ ${fuseCount} 次）P2 只能写进 --remaining 遗留建议`)
     : null;
 
   return [

@@ -991,14 +991,15 @@ test('回归 R3-1B：存在未发布本机结论且评论 GET 正常时，评论
   assert.ok(unreplied.refs.some((r) => r.id === 10 && r.commentId === 201), JSON.stringify(unreplied));
 });
 
-test('回归 R3-2：第 1、2 轮 brief 终审口径区分范围且明确 P0/P1/P2 均可打回', (t) => {
+test('回归 R3-2：熔断前 brief 终审口径按打回次数区分范围且明确 P0/P1/P2 均可打回', (t) => {
   const f = createFixture(t);
   const p2 = '1. 【P2】文案待优化\n   入口：GET /orders\n   证据：list.ts:18 复现';
 
   const d1 = f.dispatch('r3-brief-r1');
   const b1 = f.loopctl(['brief', '--run', f.runPath, '--role', 'finalReviewer', '--issue', '#15', '--change', '10']);
   assert.equal(b1.code, 0, b1.stdout + b1.stderr);
-  assert.match(b1.stdout, /首轮深审（全单/);
+  assert.match(b1.stdout, /尚未打回（第 1 次派审/);
+  assert.match(b1.stdout, /全单深审/);
   assert.match(b1.stdout, /P0\/P1\/P2 均可打回/);
 
   assert.equal(f.verdict(d1, '打回', ['--must-fix', p2]).code, 0);
@@ -1006,12 +1007,11 @@ test('回归 R3-2：第 1、2 轮 brief 终审口径区分范围且明确 P0/P1/
   f.dispatch('r3-brief-r2');
   const b2 = f.loopctl(['brief', '--run', f.runPath, '--role', 'finalReviewer', '--issue', '#15', '--change', '10']);
   assert.equal(b2.code, 0, b2.stdout + b2.stderr);
-  assert.match(b2.stdout, /第 2 轮复审（熔断前/);
+  assert.match(b2.stdout, /已打回 1 次、未熔断/);
   assert.match(b2.stdout, /核上轮必改项与直接影响面/);
   assert.match(b2.stdout, /P0\/P1\/P2 均可打回/);
   assert.match(b2.stdout, /问题尽量一次挖透/);
-  assert.doesNotMatch(b2.stdout, /普通复审/);
-  assert.doesNotMatch(b2.stdout, /仅允许就 P0\/P1 打回/);
+  assert.doesNotMatch(b2.stdout, /首轮|第 2 轮|普通复审|仅允许就 P0\/P1 打回/);
 });
 
 test('回归 R3-3：去重兼容不同列表符号（1./- ）与续行缩进及加粗标签，内容不同时不误判', (t) => {
@@ -1113,4 +1113,107 @@ test('回归 R3-5：同一列表内部（--must-fix 与 --remaining 各自）重
   const ok = f.verdict(d, '通过', ['--remaining', distinctList]);
   assert.equal(ok.code, 0, ok.stdout);
   assert.deepEqual(ok.json.grades, { p0: 0, p1: 0, p2: 2 });
+});
+
+test('回归 R4-1：单张 PR 评论 503 时仍写盘保存其他 PR 提醒节奏，且保留失败单的评论相关状态', (t) => {
+  const f = createFixture(t);
+  const p1 = '1. 【P1】负数库存校验错误\n   入口：POST /orders\n   证据：create.ts:18 复现';
+
+  // #10 有待补发结论并重入待终审
+  const d1 = f.dispatch('r4-state-10');
+  const s1 = f.readState();
+  s1.failVerdictPost = true;
+  f.writeState(s1);
+  assert.equal(f.verdict(d1, '打回', ['--must-fix', p1]).json.auditPending, true);
+  f.requeue();
+
+  // 预置上一轮 tick-state 中 #10 的评论相关状态
+  const tickStatePath = f.runPath.replace(/\.json$/, '.tick-state.controller.json');
+  const priorCommentReminder = { sentAt: Date.parse('2026-11-24T04:10:00Z') };
+  const priorChangeCommentState = { maxCommentId: 201, documents: ['https://docs.example.test/spec'] };
+  fs.writeFileSync(tickStatePath, JSON.stringify({
+    owner: 'ctrl-1',
+    lastWake: '2026-11-24T12:10:00+08:00',
+    controllerReminders: {
+      [`reply-comment:${REPO}#10@change:201`]: priorCommentReminder,
+    },
+    changes: {
+      [`${REPO}#10`]: priorChangeCommentState,
+    },
+  }));
+
+  // 05:00：#10 评论 GET 返回 503；#11 挂「待合并」触发 CONTROLLER_WAITING；#12 挂「待终审」正常派审
+  const sOutage = f.readState();
+  sOutage.failVerdictPost = false;
+  sOutage.failReads = true;
+  sOutage.prs[`${REPO}#11`] = {
+    ...sOutage.prs[`${REPO}#10`],
+    headRefName: 'feat/waiting-11',
+    labels: [{ name: '待合并' }, { name: `需求:${f.req}` }],
+  };
+  sOutage.prs[`${REPO}#12`] = {
+    ...sOutage.prs[`${REPO}#10`],
+    headRefName: 'feat/queued-12',
+    labels: [{ name: '待终审' }, { name: `需求:${f.req}` }],
+  };
+  f.writeState(sOutage);
+
+  const tick1 = f.loopctl(['tick', '--req', f.req, '--role', 'controller', '--now', '2026-11-24T05:00:00Z', '--apply']);
+  assert.equal(tick1.code, 0, tick1.stdout + tick1.stderr);
+  const actions1 = tick1.json.runs?.[0]?.actions ?? [];
+  assert.ok(readReviews(f.runPath)[0].commentId, '05:00 应成功补发 #10 结论');
+  assert.ok(actions1.some((a) => a.kind === 'review-dispatch' && a.code === 'dispatch' && a.refs?.[0]?.id === 12), '05:00 应为 #12 派审');
+  const wait1 = actions1.find((a) => a.code === 'CONTROLLER_WAITING');
+  assert.ok(wait1?.refs?.some((r) => r.id === 11), `05:00 应首次提醒 #11：${JSON.stringify(actions1)}`);
+
+  // 断言 05:00 已写盘保存 #11 提醒时间，且 #10 原评论相关状态既未推进也未清掉
+  const savedAfterTick1 = JSON.parse(fs.readFileSync(tickStatePath, 'utf8'));
+  assert.equal(savedAfterTick1.controllerReminders[`pending-merge:${REPO}#11@${HEAD_SHA}`]?.sentAt, Date.parse('2026-11-24T05:00:00Z'));
+  assert.deepEqual(savedAfterTick1.controllerReminders[`reply-comment:${REPO}#10@change:201`], priorCommentReminder);
+  assert.deepEqual(savedAfterTick1.changes[`${REPO}#10`], priorChangeCommentState);
+
+  // 05:05 评论 GET 恢复，距离 05:00 不足 2 工作小时，#11 不得重复出现在 CONTROLLER_WAITING
+  const sRecover = f.readState();
+  sRecover.failReads = false;
+  f.writeState(sRecover);
+  const tick2 = f.loopctl(['tick', '--req', f.req, '--role', 'controller', '--now', '2026-11-24T05:05:00Z', '--apply']);
+  assert.equal(tick2.code, 0, tick2.stdout + tick2.stderr);
+  const actions2 = tick2.json.runs?.[0]?.actions ?? [];
+  const wait2 = actions2.find((a) => a.code === 'CONTROLLER_WAITING');
+  assert.ok(!wait2?.refs?.some((r) => r.id === 11), `05:05 不应重复提醒 #11：${JSON.stringify(actions2)}`);
+  assert.ok(actions2.some((a) => a.kind === 'review-dispatch' && a.code === 'dispatch' && a.refs?.[0]?.id === 10), '05:05 恢复后应为 #10 派审');
+});
+
+test('回归 R4-2：首轮超时重派（round=2, rejectCount=0）brief 写全单深审且不按轮次计数；打回 1 次后写核上轮必改项', (t) => {
+  const f = createFixture(t);
+  const p1 = '1. 【P1】校验缺失\n   入口：POST /orders\n   证据：create.ts:18 复现';
+
+  // 第 1 次派审超时（未落结论），退回待终审后第 2 次派审：round=2, rejectCount=0
+  const d1 = f.dispatch('r4-timeout-1');
+  assert.equal(d1.round, 1);
+  f.requeue();
+  const d2 = f.dispatch('r4-timeout-2');
+  assert.equal(d2.round, 2);
+  assert.equal(d2.rejectCount, 0);
+
+  const bAfterTimeout = f.loopctl(['brief', '--run', f.runPath, '--role', 'finalReviewer', '--issue', '#15', '--change', '10']);
+  assert.equal(bAfterTimeout.code, 0, bAfterTimeout.stdout + bAfterTimeout.stderr);
+  assert.match(bAfterTimeout.stdout, /尚未打回（第 2 次派审/);
+  assert.match(bAfterTimeout.stdout, /全单深审/);
+  assert.match(bAfterTimeout.stdout, /P0\/P1\/P2 均可打回/);
+  assert.doesNotMatch(bAfterTimeout.stdout, /首轮|第 2 轮/);
+
+  // 打回 1 次后再派审：round=3, rejectCount=1
+  assert.equal(f.verdict(d2, '打回', ['--must-fix', p1]).code, 0);
+  f.requeue();
+  const d3 = f.dispatch('r4-after-reject-1');
+  assert.equal(d3.round, 3);
+  assert.equal(d3.rejectCount, 1);
+
+  const bAfterReject = f.loopctl(['brief', '--run', f.runPath, '--role', 'finalReviewer', '--issue', '#15', '--change', '10']);
+  assert.equal(bAfterReject.code, 0, bAfterReject.stdout + bAfterReject.stderr);
+  assert.match(bAfterReject.stdout, /已打回 1 次、未熔断/);
+  assert.match(bAfterReject.stdout, /核上轮必改项/);
+  assert.match(bAfterReject.stdout, /P0\/P1\/P2 均可打回/);
+  assert.doesNotMatch(bAfterReject.stdout, /首轮|第 2 轮/);
 });
