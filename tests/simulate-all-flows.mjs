@@ -2337,7 +2337,7 @@ function scenarioTick(tmp) {
   resetWithReviews(headState(['待终审']));
   const dispatchPost = startReview('github', 'controller', 'reviewer-a');
   const record = dispatchPost.json;
-  const validMustFix = ['--must-fix', '1. 必改项示例\n入口：POST /api/orders\n证据：src/order.js:10 未校验空值'];
+  const validMustFix = ['--must-fix', '1. 【P1】必改项示例\n入口：POST /api/orders\n证据：src/order.js:10 未校验空值'];
   const wrongNonce = finishReview('github', record, '通过', 10, ['--nonce', 'incorrect']);
   const reviewPost = finishReview('github', record, '通过', 10, ['--keep', '保留默认逻辑']);
   const duplicate = finishReview('github', record, '打回', 10, validMustFix);
@@ -2500,7 +2500,7 @@ function scenarioTick(tmp) {
   resetWithReviews(queuedGitLab);
   const glDispatch = startReview('gitlab', 'dispatch', 'gitlab-review');
   const glReview = finishReview('gitlab', glDispatch.json, '打回', 10, [
-    '--slot', 'A', '--must-fix', '1. 修复空值\n入口：POST /api/orders\n证据：src/order.js:12 未判空',
+    '--slot', 'A', '--must-fix', '1. 【P1】修复空值\n入口：POST /api/orders\n证据：src/order.js:12 未判空',
   ]);
   const glNotes = readJson(fake.env.FAKE_FORGE_STATE).comments?.['projects/acme%2Floop/merge_requests/10/notes']?.[0] ?? [];
   eq('R27 派审评论由调度实际会话签名', glNotes[0]?.body.split('\n')[0], '主研发调度 ｜ 主研发 ｜ disp-1');
@@ -2584,9 +2584,9 @@ function scenarioTick(tmp) {
     const unpublished = startReview('github', 'controller', `unpublished-${conclusion}`).json;
     const beforeFailure = readJson(fake.env.FAKE_FORGE_STATE);
     resetForge({ ...beforeFailure, failApi: [changeNotes(10)] });
-    const failedPublish = finishReview('github', unpublished, conclusion, 10, [
-      '--must-fix', '1. 保存待发布正文\n入口：POST /api/orders\n证据：src/order.js:20 实测复现',
-    ]);
+    const failedPublish = finishReview('github', unpublished, conclusion, 10, conclusion === '打回'
+      ? ['--must-fix', '1. 【P1】保存待发布正文\n入口：POST /api/orders\n证据：src/order.js:20 实测复现']
+      : ['--keep', '保存待发布正文']);
     const afterFailure = readJson(fake.env.FAKE_FORGE_STATE);
     delete afterFailure.failApi;
     resetForge(afterFailure);
@@ -3010,8 +3010,70 @@ function scenarioTick(tmp) {
   ok('较晚的 Forge 心跳优先于本机旧记录，不报失联',
     actions(tick('patrol', '2024-05-02T10:30:00Z')).every((item) => item.code !== 'CONTROLLER_DISCONNECTED'));
 
-
-
+  // v2.3 GitLab L3 终审分级与熔断后收窄闭环
+  register({
+    ...run, forge: 'gitlab', gitlabHost: 'gitlab.acme.test', tier: 'L3', slot: '主研发',
+    issues: { master: 5 }, changes: [{ repo, id: 10 }],
+  });
+  const glMrKey = `${repo}!10`;
+  const glNotesKey = 'projects/acme%2Floop/merge_requests/10/notes';
+  const glQueuedLabels = ['待终审', '需求:tick-demo', '槽位A'];
+  const glState = {
+    issues: {
+      [repo + '#5']: { state: 'opened', updated_at: now, labels: [], description: masterBody, author: { username: 'dev-a' } },
+    },
+    mrs: {
+      [glMrKey]: {
+        state: 'opened', updated_at: now, labels: [...glQueuedLabels],
+        sha: meta.headRefOid, source_branch: 'dev/one', target_branch: baseline,
+        description: '关联 #5', web_url: 'https://gitlab.acme.test/acme/loop/-/merge_requests/10',
+      },
+    },
+  };
+  resetWithReviews(glState);
+  const glP2 = '1. P2：列表文案不区分空态原因\n入口：GET /orders\n证据：list.ts:21 统一渲染暂无数据';
+  const glP1 = '1. 【P1】下单数量未校验负数\n入口：POST /orders\n证据：create.ts:11 允许负数入库';
+  const glHostArgs = ['--hostname', 'gitlab.acme.test'];
+  const glDispatchAt = (roundNum) => {
+    const t = tick('dispatch', now, true);
+    const act = actions(t).find(({ kind, code }) => kind === 'review-dispatch' && code === 'dispatch');
+    eq(`GitLab L3 第 ${roundNum} 轮 tick 调度口径`, [act?.rejectCount, act?.fullReReview, act?.refs?.[0]?.id],
+      [roundNum - 1, roundNum === 3, 10]);
+    const disp = forge(['dispatch-review', ...changeArgs('gitlab', 10), ...glHostArgs,
+      '--role', 'dispatch', '--head-sha', meta.headRefOid, '--session', `v23-gl-r${roundNum}`, '--by', 'disp-1'], fake.env);
+    eq(`GitLab L3 第 ${roundNum} 轮派审登记`, [disp.code, disp.json.round, disp.json.rejectCount, disp.json.fullReReview],
+      [0, roundNum, roundNum - 1, roundNum === 3]);
+    return disp.json;
+  };
+  const glVerdict = (rec, conclusion, extra) => forge(['verdict', ...changeArgs('gitlab', 10), ...glHostArgs,
+    ...reviewFlags, '--dispatch-id', rec.dispatchId, '--nonce', rec.nonce, '--round', String(rec.round),
+    '--conclusion', conclusion, '--session', rec.session, '--slot', 'A', ...extra], fake.env);
+  for (const [idx, mustFix] of [glP2, glP1].entries()) {
+    const rec = glDispatchAt(idx + 1);
+    const rej = glVerdict(rec, '打回', ['--must-fix', mustFix]);
+    eq(`GitLab L3 第 ${idx + 1} 轮打回成功`, [rej.code, rej.json.code, rej.json.rejectCount], [0, 'REVIEW_REJECTED', idx + 1]);
+    const nextState = readJson(fake.env.FAKE_FORGE_STATE);
+    nextState.mrs[glMrKey].labels = [...glQueuedLabels];
+    fake.reset(nextState);
+  }
+  const glRound3 = glDispatchAt(3);
+  const glJournalFile = runFile.replace(/\.json$/, '.reviews.jsonl');
+  const glJournalBefore = fs.readFileSync(glJournalFile, 'utf8');
+  const glForgeBefore = fs.readFileSync(fake.env.FAKE_FORGE_STATE, 'utf8');
+  const glBlocked = glVerdict(glRound3, '打回', ['--must-fix', glP2]);
+  eq('GitLab L3 熔断后含 P2 打回被拒且零副作用', [
+    glBlocked.code, glBlocked.json.code,
+    fs.readFileSync(glJournalFile, 'utf8') === glJournalBefore,
+    fs.readFileSync(fake.env.FAKE_FORGE_STATE, 'utf8') === glForgeBefore,
+  ], [2, 'MUST_FIX_P2_AFTER_FUSE', true, true]);
+  const glPassed = glVerdict(glRound3, '通过', ['--remaining', glP2]);
+  const glFinalState = readJson(fake.env.FAKE_FORGE_STATE);
+  const glVerdictNote = glFinalState.comments?.[glNotesKey]?.flat().findLast(({ body }) => body.includes('liteloop:verdict'));
+  const glVerdictMeta = JSON.parse(/^<!-- liteloop:verdict ([^\r\n]+?) -->$/m.exec(glVerdictNote?.body ?? '')?.[1] ?? '{}');
+  eq('GitLab L3 原派审改通过走人工裁决，MR notes 含 grades 并保留需求与槽位标签及待合并', [
+    glPassed.code, glPassed.json.code, glPassed.json.state,
+    glFinalState.mrs[glMrKey].state, glFinalState.mrs[glMrKey].labels, glVerdictMeta.grades,
+  ], [0, 'REJECT_FUSE_FULL_REVIEW', 'manual', 'opened', ['需求:tick-demo', '槽位A', '待合并'], { p0: 0, p1: 0, p2: 1 }]);
 }
 
 function scenarioDrillRegressions(tmp) {

@@ -7,7 +7,7 @@ import { CliError } from './common.mjs';
  * @typedef {{baseSha: string, headSha: string, command: string, exitCode: number, durationMs: number}} TrialRecord
  * @typedef {{type: 'merge-result', dispatchId: string, state: 'manual'|'merged'|'invalidated', code: string, reasonCodes?: string[], trial?: TrialRecord}} FinishedMerge
  * @typedef {{dispatchId: string, pr: {repo: string, id: number}, headSha: string, round: number, session: string,
- *   nonce: string, at: string, rejectDispatchIds?: string[], verdict?: {conclusion: '通过'|'打回', risk: Record<string, boolean>, body?: string},
+ *   nonce: string, at: string, rejectDispatchIds?: string[], verdict?: {conclusion: '通过'|'打回', risk: Record<string, boolean>, grades?: {p0: number, p1: number, p2: number}, body?: string},
  *   commentId?: number, merge?: WaitingMerge|FinishedMerge}} ReviewDispatch
  */
 
@@ -28,6 +28,11 @@ export function reviewJournalPath(runPath) {
 
 export function validRisk(risk) {
   return RISK_RULES.every(({ key }) => typeof risk?.[key] === 'boolean');
+}
+
+export function validGrades(grades) {
+  return Boolean(grades && typeof grades === 'object'
+    && ['p0', 'p1', 'p2'].every((k) => Number.isSafeInteger(grades[k]) && grades[k] >= 0));
 }
 
 /** @returns {ReviewDispatch[]} */
@@ -52,6 +57,7 @@ export function readReviews(runPath) {
       dispatches.set(row.dispatchId, { ...row, headSha: row.headSha.toLowerCase() });
     } else if (row?.type === 'verdict' && dispatch && !dispatch.verdict
       && ['通过', '打回'].includes(row.conclusion) && validRisk(row.risk)
+      && (row.grades === undefined || validGrades(row.grades))
       && (row.body === undefined || typeof row.body === 'string')) {
       dispatch.verdict = row;
     } else if (row?.type === 'published' && dispatch?.verdict && !dispatch.commentId

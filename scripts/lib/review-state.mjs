@@ -1,4 +1,4 @@
-import { FULL_SHA, validRisk } from './review-journal.mjs';
+import { FULL_SHA, validGrades, validRisk } from './review-journal.mjs';
 
 const NEEDS_CHANGES = new Set(['SOURCE_CONTAINS_MERGE_COMMITS', 'SOURCE_LINEAGE_INVALID',
   'MERGE_CONFLICT', 'MISSING_ISSUE_REF', 'TRIAL_MERGE_CONFLICT', 'TRIAL_TEST_FAILED']);
@@ -29,7 +29,8 @@ function auditRecord(note) {
     try { data = JSON.parse(block[1]); } catch { return null; }
     if (typeof data?.dispatchId === 'string' && data.dispatchId && typeof data.headSha === 'string' && FULL_SHA.test(data.headSha)
       && Number.isSafeInteger(data.round) && data.round > 0 && typeof data.session === 'string' && data.session
-      && ['通过', '打回'].includes(data.conclusion) && validRisk(data.risk)) {
+      && ['通过', '打回'].includes(data.conclusion) && validRisk(data.risk)
+      && (data.grades === undefined || validGrades(data.grades))) {
       return { ...data, headSha: data.headSha.toLowerCase(), commentId: note.id };
     }
     return null;

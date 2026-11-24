@@ -27,7 +27,7 @@ import { formatScriptComment } from './lib/action-messages.mjs';
 import { dispatchSlot, scopedChanges } from './lib/tick-dispatch.mjs';
 import { activeSlotClaims, forgeSlotClaims, slotKey } from './lib/slot-claims.mjs';
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 const GLAB = process.env.GLAB_BIN || 'glab';
 const GH = process.env.GH_BIN || 'gh';
 const GIT = process.env.GIT_BIN || 'git';
@@ -566,7 +566,10 @@ function dispatchReview(ctx, flags) {
       `已派终审：第 ${round} 轮 ｜ 会话标识：${session} ｜ head SHA：${headSha} ｜ 派审 ID：${dispatchId}`,
     ].join('\n'));
     emitReal(changeLabel(ctx, { ...pr, add: '终审中', remove: '待终审' }));
-    return { ok: true, dispatchId, round, headSha, session, nonce };
+    return {
+      ok: true, dispatchId, round, headSha, session, nonce,
+      rejectCount: review.rejectCount, fullReReview: review.rejectCount >= (run.thresholds?.rejectFuseCount ?? 2),
+    };
   });
 }
 
@@ -584,27 +587,59 @@ function verdictRisk(value) {
   return risk;
 }
 
-function validateMustFix(text) {
+const GRADE_PREFIX = /^((?:\d+(?:\.(?!\d)|[、)）])|-[ \t])[ \t]*)?(?:(\*{1,2}|_{1,2})(?:(?:【(P[012])】|\[(P[012])\]|(P[012])[：:])\2[ \t]*|(P[012])\2(?:[ \t]*[：:][ \t]*|[ \t]+)?)|(?:【(P[012])】|\[(P[012])\])[ \t]*|(P[012])(?:[：:][ \t]*|[ \t]+(?:[-—][ \t]+)?|(?=\n)))/i;
+const FIELD_LABEL = /(?:(\*{1,2}|_{1,2})(入口|证据)(?:\1[：:]|[：:]\1)|(入口|证据)[：:])[ \t]*/g;
+
+function parseReviewItems(text, label = '必改项') {
   const lines = String(text).split(/\r\n?|\n/);
   const indent = lines.reduce((min, line) => line.trim() ? Math.min(min, line.match(/^[ \t]*/)[0].length) : min, Infinity);
   const items = lines.map((line) => line.slice(indent)).join('\n')
     .split(/\n(?=\d+(?:\.(?!\d)|[、)）])|-[ \t])/).map((item) => item.trim()).filter(Boolean);
   const incomplete = [];
+  const missingGrade = [];
+  const grades = { p0: 0, p1: 0, p2: 0 };
+  const parsed = [];
   items.forEach((item, idx) => {
+    const headline = item.split('\n')[0].trim();
+    const short = headline.length > 80 ? `${headline.slice(0, 80)}…` : headline;
     const fields = new Set();
     for (const [, field, content] of item.replace(/[*_]/g, '').matchAll(/(入口|证据)[：:]([\s\S]*?)(?=(?:入口|证据)[：:]|$)/g)) {
       if (content.replace(/[\s；;，,。、|｜\-—]+/g, '')) fields.add(field);
     }
     const missing = ['入口', '证据'].filter((field) => !fields.has(field)).map((field) => `${field}：`);
-    if (missing.length) {
-      const headline = item.split('\n')[0].trim();
-      incomplete.push({ index: idx + 1, item: headline.length > 80 ? `${headline.slice(0, 80)}…` : headline, missing });
+    if (missing.length) incomplete.push({ index: idx + 1, item: short, missing });
+    const match = GRADE_PREFIX.exec(item);
+    if (!match) {
+      missingGrade.push({ index: idx + 1, item: short });
+      return;
     }
+    const grade = match.slice(3).find(Boolean).toLowerCase();
+    grades[grade] += 1;
+    const normalizedBody = `【${grade.toUpperCase()}】${item.slice(match[0].length)}`;
+    const key = normalizedBody.replace(FIELD_LABEL, (_, _em, a, b) => `${a ?? b}：`)
+      .split('\n').map((line) => line.trim()).filter(Boolean).join('\n');
+    parsed.push({ index: idx + 1, item: short, grade, key, text: `${match[1] ?? ''}${normalizedBody}` });
   });
   if (!items.length || incomplete.length) {
     const detail = incomplete.map(({ index, item, missing }) => `第 ${index} 条（${item}）缺${missing.join('、')}`).join('；');
-    throw new CliError('MUST_FIX_INCOMPLETE', `打回的每条必改项必须同时包含「入口：」和「证据：」${detail ? `：${detail}` : ''}`, { incomplete });
+    throw new CliError('MUST_FIX_INCOMPLETE', `${label}的每条必须同时包含「入口：」和「证据：」${detail ? `：${detail}` : ''}`, { incomplete });
   }
+  if (missingGrade.length) {
+    const detail = missingGrade.map(({ index, item }) => `第 ${index} 条（${item}）`).join('；');
+    throw new CliError('MUST_FIX_GRADE_MISSING', `${label}的每条必须以【P0】、【P1】或【P2】开头：${detail}`, { missingGrade });
+  }
+  const seen = new Map();
+  const dupes = [];
+  for (const entry of parsed) {
+    const first = seen.get(entry.key);
+    if (first) dupes.push({ first: first.index, index: entry.index, item: entry.item });
+    else seen.set(entry.key, entry);
+  }
+  if (dupes.length) {
+    const detail = dupes.map(({ first, index, item }) => `第 ${first} 条与第 ${index} 条（${item}）`).join('；');
+    throw new CliError('DUPLICATE_REVIEW_ITEM', `${label}中存在重复条目，请只保留一处：${detail}`, { items: dupes });
+  }
+  return { text: parsed.map((entry) => entry.text).join('\n'), grades, items: parsed };
 }
 
 export function publishVerdict(run, runPath, dispatch) {
@@ -640,18 +675,53 @@ function changeVerdict(ctx, flags) {
   if (/[\r\n｜|]/.test(slot)) throw new CliError('INVALID_SLOT', '--slot 不能含换行或分隔符');
   const dispatchId = required(flags, 'dispatch-id');
   const nonce = required(flags, 'nonce');
-  const reviewText = (key, needed = false) => !needed && flags[key] === undefined ? '无'
-    : required(flags, key).replace(/<!--(?=\s*liteloop:verdict\b)/g, '&lt;!--').replaceAll(nonce, '[已隐藏]');
-  const mustFix = reviewText('must-fix', conclusion === '打回');
-  if (conclusion === '打回') validateMustFix(mustFix);
+  const reviewText = (key, needed = false) => {
+    const raw = flags[key];
+    if (raw === true) throw new CliError('MISSING_FLAG', `缺少必填参数 --${key}`);
+    const text = needed ? required(flags, key) : (raw === undefined || String(raw).trim() === '' ? '无' : String(raw));
+    return text.replace(/<!--(?=\s*liteloop:verdict\b)/g, '&lt;!--').replaceAll(nonce, '[已隐藏]');
+  };
+  const rawMustFix = reviewText('must-fix', conclusion === '打回');
+  if (conclusion === '通过' && rawMustFix.trim() !== '无') {
+    throw new CliError('PASS_WITH_MUST_FIX', '结论为「通过」时 --must-fix 只能省略或填「无」；P2 遗留建议请放进 --remaining，有 P0/P1 请改为「打回」');
+  }
+  const mustFixParsed = conclusion === '打回' ? parseReviewItems(rawMustFix, '必改项') : null;
+  const mustFix = mustFixParsed ? mustFixParsed.text : '无';
+  const rawRemaining = reviewText('remaining');
+  const remainingParsed = rawRemaining.trim() === '无' ? null : parseReviewItems(rawRemaining, '遗留建议');
+  if (remainingParsed && (remainingParsed.grades.p0 > 0 || remainingParsed.grades.p1 > 0)) {
+    const high = remainingParsed.items.filter(({ grade }) => grade !== 'p2');
+    const detail = high.map(({ index, item }) => `第 ${index} 条（${item}）`).join('；');
+    throw new CliError('REMAINING_GRADE_TOO_HIGH', `遗留建议仅允许 P2，P0/P1 必须打回：${detail}`, {
+      items: high.map(({ index, item, grade }) => ({ index, item, grade: grade.toUpperCase() })),
+    });
+  }
+  if (mustFixParsed && remainingParsed) {
+    const mustFixKeys = new Set(mustFixParsed.items.map(({ key }) => key));
+    const duplicates = remainingParsed.items.filter(({ key }) => mustFixKeys.has(key));
+    if (duplicates.length) {
+      const detail = duplicates.map(({ index, item }) => `第 ${index} 条（${item}）`).join('；');
+      throw new CliError('DUPLICATE_REVIEW_ITEM', `同一条目不能同时出现在必改项和遗留建议中，请只保留一处：${detail}`, {
+        items: duplicates.map(({ index, item }) => ({ index, item })),
+      });
+    }
+  }
+  const remaining = remainingParsed ? remainingParsed.text : '无';
+  const grades = {
+    p0: (mustFixParsed?.grades.p0 ?? 0) + (remainingParsed?.grades.p0 ?? 0),
+    p1: (mustFixParsed?.grades.p1 ?? 0) + (remainingParsed?.grades.p1 ?? 0),
+    p2: (mustFixParsed?.grades.p2 ?? 0) + (remainingParsed?.grades.p2 ?? 0),
+  };
   const body = [
     `终审 ｜ ${slot} ｜ ${session}`,
     `结论：${conclusion}（第 ${round} 轮）`,
+    `问题分级：P0 ${grades.p0} · P1 ${grades.p1} · P2 ${grades.p2}`,
     '必改项：', mustFix,
+    '遗留建议：', remaining,
     '不要改动的范围：', reviewText('keep'),
     `风险：${Object.values(risk).some(Boolean) ? '高' : '低'}`,
     ...RISK_RULES.map(({ key, label }, index) => `${index + 1}. ${label}：${risk[key] ? '是' : '否'}`),
-    '', `<!-- liteloop:verdict ${JSON.stringify({ dispatchId, round, conclusion, risk, headSha, session })} -->`,
+    '', `<!-- liteloop:verdict ${JSON.stringify({ dispatchId, round, conclusion, risk, grades, headSha, session })} -->`,
   ].join('\n');
   return withReviewRun(ctx, flags, (runPath, run, pr) => {
     const history = reviewsFor(readReviews(runPath), pr);
@@ -667,9 +737,22 @@ function changeVerdict(ctx, flags) {
     if (!live.labels.includes('终审中') || live.labels.includes('待终审')) {
       throw new CliError('REVIEW_NOT_ACTIVE', '变更单没有可登记结论的当前派审，请核对终审状态');
     }
-    dispatch.verdict = { type: 'verdict', dispatchId, conclusion, risk, body };
-    appendReview(runPath, dispatch.verdict);
     const member = !changeMembership(run, live);
+    if (mustFixParsed?.grades.p2 > 0) {
+      const fuseCount = run.thresholds?.rejectFuseCount ?? 2;
+      const priorRejects = Array.isArray(dispatch.rejectDispatchIds)
+        ? dispatch.rejectDispatchIds.length
+        : resolveReviewState(history, [], headSha).rejectCount;
+      if (priorRejects >= fuseCount) {
+        const p2Items = mustFixParsed.items.filter(({ grade }) => grade === 'p2');
+        const detail = p2Items.map(({ index, item }) => `第 ${index} 条（${item}）`).join('；');
+        throw new CliError('MUST_FIX_P2_AFTER_FUSE',
+          `已累计打回 ${priorRejects} 次（达到熔断阈值 ${fuseCount}），熔断后必改项不能包含 P2，请改写到 --remaining（只剩 P2 时请给「通过」）：${detail}`,
+          { rejectCount: priorRejects, rejectFuseCount: fuseCount, items: p2Items.map(({ index, item }) => ({ index, item })) });
+      }
+    }
+    dispatch.verdict = { type: 'verdict', dispatchId, conclusion, risk, grades, body };
+    appendReview(runPath, dispatch.verdict);
     const publication = { auditPending: !member };
     if (member) {
       try {
@@ -684,13 +767,13 @@ function changeVerdict(ctx, flags) {
     }
     const { rejectCount } = resolveReviewState(history, notes, headSha);
     if (conclusion === '打回') {
-      const result = { ok: true, dispatchId, conclusion, state: 'rejected', code: 'REVIEW_REJECTED', rejectCount, ...publication };
+      const result = { ok: true, dispatchId, conclusion, grades, state: 'rejected', code: 'REVIEW_REJECTED', rejectCount, ...publication };
       if (member) applyVerdictLabels(ctx, pr, live, result);
       else result.message = '变更目标已离开需求基线，请人工处理打回结论。';
       return result;
     }
     const result = mergeReviewedChange(ctx, runPath, run, dispatch, rejectCount, { live });
-    return { ...result, ok: true, dispatchId, conclusion, rejectCount, ...publication };
+    return { ...result, ok: true, dispatchId, conclusion, grades, rejectCount, ...publication };
   });
 }
 
@@ -1252,7 +1335,7 @@ export function registeredDemandIssues(run) {
  * @typedef {{repo: string, id: number, key?: string, user?: string}} MemberRef
  */
 /** Run 注册对象只提供引用。状态、正文、标签、评论与变更单头部均从 Forge 读取。 */
-export function collectRunFacts(run, { includeBaselines = false, localLedgerKey = null, issuesOnly = false, skipChangeComments = () => false } = {}) {
+export function collectRunFacts(run, { includeBaselines = false, localLedgerKey = null, issuesOnly = false, skipChangeComments = () => false, isolateChangeComments = false } = {}) {
   const facts = {
     req: run.req, tier: run.tier, collectedAt: new Date().toISOString(), ledgers: [], changes: [], subIssues: [],
     errors: [], warnings: /** @type {MembershipWarning[]} */ ([]), slotClaims: [],
@@ -1491,8 +1574,17 @@ export function collectRunFacts(run, { includeBaselines = false, localLedgerKey 
       continue;
     }
     const item = { repo, id, ...change };
-    const comments = skipChangeComments(item) ? [] : attempt(source + ':comments', () => commentsWithReplies(ctx, 'change', repo, id));
-    if (comments) facts.changes.push({ ...item, comments });
+    if (skipChangeComments(item)) {
+      facts.changes.push({ ...item, comments: [] });
+    } else if (isolateChangeComments) {
+      let comments = null;
+      let commentError = null;
+      try { comments = commentsWithReplies(ctx, 'change', repo, id); } catch (error) { commentError = factFailure(source + ':comments', error); }
+      facts.changes.push({ ...item, comments: comments ?? [], ...(commentError ? { commentError } : {}) });
+    } else {
+      const comments = attempt(source + ':comments', () => commentsWithReplies(ctx, 'change', repo, id));
+      if (comments) facts.changes.push({ ...item, comments });
+    }
   }
   facts.warnings = [...warnings.values()];
   return facts;
@@ -2288,7 +2380,7 @@ function usage() {
       'change-label --forge <f> --repo <...> --id <num> [--add a,b] [--remove c]',
       'change-comment --forge <f> --repo <...> --id <num> --body <text>',
       'dispatch-review --run <run.json> --role controller|dispatch --forge <f> --repo <...> --id <num> --head-sha <40位> --session <新终审会话标识> [--by <派审会话标识>]（dispatch 必填 --by）',
-      'verdict --run <run.json> --dispatch-id <id> --nonce <nonce> --forge <f> --repo <...> --id <num> --round <n> --conclusion 通过|打回 --risk contract=0,hotFile=0,migration=0,switchDefault=0,signature=0,foundation=0 --head-sha <40位> --session <id> [--slot <槽位>] [--must-fix <text>（打回必填，每条须含「入口：」和「证据：」）] [--keep <text>]',
+      'verdict --run <run.json> --dispatch-id <id> --nonce <nonce> --forge <f> --repo <...> --id <num> --round <n> --conclusion 通过|打回 --risk contract=0,hotFile=0,migration=0,switchDefault=0,signature=0,foundation=0 --head-sha <40位> --session <id> [--slot <槽位>] [--must-fix <text>（打回必填，每条须以【P0】/【P1】/【P2】开头并含「入口：」和「证据：」，熔断后禁 P2）] [--remaining <text>（可选，仅允许【P2】并含「入口：」和「证据：」）] [--keep <text>]',
       'acceptance --run <run.json> --conclusion 通过|不通过 --report <文本或链接> --model <验收模型> --session <id>',
       'change-merge --forge <f> --repo <...> --id <num> --head-sha <sha> --target <需求基线> [--run <run.json>] [--repo-path <dir>] [--baseline-start-sha <sha>] [--require-lineage] [--require-issue-ref] [--protected-branches a,b] [--depends-on <json>]',
       'labels-sync --forge <f> --repos <r1,r2> [--req <slug>] [--labels a,b,c | --slots 主研发,A,B] [--overwrite（仅 GitHub）]',

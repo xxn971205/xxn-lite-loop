@@ -45,7 +45,7 @@ import { activeSlotClaims, forgeSlotClaims, slotKey } from './lib/slot-claims.mj
 import { runNotification } from './lib/outbox.mjs';
 import { verifyGroup } from './lib/lark-im.mjs';
 
-const VERSION = '2.2.0';
+const VERSION = '2.3.0';
 const SKILL_NAME = 'xxn-lite-loop';
 const DEFAULT_WORK_HOURS = { start: '09:00', end: '19:00', timezone: 'Asia/Shanghai' };
 const BASE_LABELS = ['待终审', '终审中', '待合并', '需修改', '阻断', '风险高', '风险低', 'bug'];
@@ -2040,7 +2040,7 @@ function teardownChecklist(run, facts, closingSummary, metrics, localLedgerKey) 
     })
     : [];
   const reviewSummary = metrics.changes === null ? '未核实'
-    : `${metrics.changes} 个变更单 / 累计打回 ${metrics.rejects} 次`;
+    : `${metrics.changes} 个变更单 / 累计打回 ${metrics.rejects} 次 / 分级合计 P0 ${metrics.grades.p0} · P1 ${metrics.grades.p1} · P2 ${metrics.grades.p2}`;
   const ledgers = ledgerTargets.map((ledger) => {
     const issue = String(ledger.id);
     const slot = ledger.key.startsWith('slot:') ? ledger.key.slice(5) : '主研发';
@@ -2136,11 +2136,17 @@ function teardownMetrics(runPath) {
   let reviews;
   try { reviews = readReviews(runPath); } catch { reviews = null; }
   const { scriptComments, tickHistoryError } = readTickHistory(runPath, { requireLog: true });
+  const grades = reviews ? reviews.reduce((sum, { verdict }) => ({
+    p0: sum.p0 + (verdict?.grades?.p0 ?? 0),
+    p1: sum.p1 + (verdict?.grades?.p1 ?? 0),
+    p2: sum.p2 + (verdict?.grades?.p2 ?? 0),
+  }), { p0: 0, p1: 0, p2: 0 }) : null;
   return {
     changes: reviews ? new Set(reviews.map(({ pr }) => issueRef(pr))).size : null,
     rejects: reviews?.filter(({ verdict }) => verdict?.conclusion === '打回').length ?? null,
     fuses: reviews ? new Set(reviews.filter(({ merge }) => hasRejectFuse(merge)).map(({ pr }) => issueRef(pr))).size : null,
     timeouts: tickHistoryError ? null : scriptComments.filter(({ code }) => code === 'REVIEW_TIMEOUT').length,
+    grades,
   };
 }
 
@@ -2861,7 +2867,17 @@ function cmdBrief(flags) {
   const changeArg = optFlag(flags, 'change');
   const reviews = changeArg ? readReviews(runPath) : [];
   const changeRef = changeArg ? briefRef(run, changeArg, 'change', [...(run.changes ?? []), ...reviews.map(({ pr }) => pr)]) : null;
-  const rejectCount = changeRef ? resolveReviewState(reviewsFor(reviews, changeRef), [], null).rejectCount : 0;
+  const changeReviews = changeRef ? reviewsFor(reviews, changeRef) : [];
+  const activeDispatch = changeReviews.at(-1) && !changeReviews.at(-1).verdict ? changeReviews.at(-1) : null;
+  const reviewState = changeRef ? resolveReviewState(changeReviews, [], null) : null;
+  const rejectCount = changeRef
+    ? (Array.isArray(activeDispatch?.rejectDispatchIds)
+      ? activeDispatch.rejectDispatchIds.length
+      : reviewState.rejectCount)
+    : 0;
+  const dispatchRound = activeDispatch?.round ?? reviewState?.round ?? 1;
+  const fuseCount = run.thresholds?.rejectFuseCount ?? 2;
+  const fullReReview = Boolean(changeRef && rejectCount >= fuseCount);
 
   const models = run.roleModels ?? {};
   const coderModel = normModel(models.coder);
@@ -2892,11 +2908,20 @@ function cmdBrief(flags) {
     ?? (run.hubRepo?.repo?.toLowerCase() === repo.toLowerCase() ? run.hubRepo : null);
   const baseline = run.baselineBranch ?? run.branch ?? null;
 
+  const reviewScopeLine = role === 'finalReviewer' && changeRef
+    ? (fullReReview
+      ? `终审口径：已熔断（已打回 ${rejectCount} 次，fullReReview=true，全量复审）；仅允许就 P0/P1 打回，P2 只能写进 --remaining 遗留建议（只剩 P2 请给「通过」），通过后仍交人裁决`
+      : rejectCount === 0
+        ? `终审口径：尚未打回（第 ${dispatchRound} 次派审，fullReReview=false）：全单深审，P0/P1/P2 均可打回，问题尽量一次挖透；熔断后（累计打回 ≥ ${fuseCount} 次）P2 只能写进 --remaining 遗留建议`
+        : `终审口径：已打回 ${rejectCount} 次、未熔断（fullReReview=false）：核上轮必改项与直接影响面，P0/P1/P2 均可打回，问题尽量一次挖透；熔断后（累计打回 ≥ ${fuseCount} 次）P2 只能写进 --remaining 遗留建议`)
+    : null;
+
   return [
     `开工前先读 ${path.join(SKILL_ROOT, 'references', 'roles.md')}#${roleMeta.anchor}`,
     `需求：${run.req ?? '未配置'}`,
     `子 Issue：#${issueRef.id}（${issueRef.url}）`,
     ...(changeRef ? [`变更单：${changeRef.url}${rejectCount > 0 ? `（已打回 ${rejectCount} 次）` : ''}`] : []),
+    ...(reviewScopeLine ? [reviewScopeLine] : []),
     `仓库：${repo}`,
     `基线分支：${baseline ?? '未配置'}`,
     `基线 SHA：${fetchBaselineSha(entry?.path, baseline)}`,

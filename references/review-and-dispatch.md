@@ -21,9 +21,9 @@ L3 的 `--by` 必填，传派审方调度会话的实际标识，供公开评论
 
 自建 Forge 实例在 `dispatch-review` 和 `verdict` 中都传运行态对应的 `--hostname`。`dispatch-review` 写入本机登记簿、发布派审评论并切换到「终审中」。
 
-用 `loopctl.mjs brief` 生成任务说明，另附 `dispatch-review` 返回的 `dispatchId`、`nonce`、`round`、`headSha` 和 `session`。nonce 只交独立终审。终审在派审方本机运行，重读 PR/MR 确认候选 SHA 后发一次结论。
+`tick` 的 `review-dispatch` 动作只作为「需要派审」的触发信号，不作为审查范围和熔断口径的依据；本轮累计打回次数和是否熔断一律以 `dispatch-review` 返回并落盘的 `rejectCount` 和 `fullReReview` 为准。登记派审后，用 `loopctl.mjs brief --run "$run_file" --role finalReviewer --issue <子Issue> --change <PR/MR>` 生成终审任务开头（自动带出 `dispatch-review` 登记的 `rejectCount`、`fullReReview`、是否已熔断及「熔断后 P2 只能写进 `--remaining` 遗留建议」的要求），另附 `dispatch-review` 返回的 `dispatchId`、`nonce`、`round`、`headSha`、`session`、`rejectCount` 和 `fullReReview`。nonce 只交独立终审。终审在派审方本机运行，重读 PR/MR 确认候选 SHA 后发一次结论。
 
-必改项须能从支持的业务入口触发，并有源码调用链或运行证据。写清用户实际看到什么、期望是什么、为何受影响。风格偏好或缺乏可达入口的疑点留作线索。普通复审核必改项和直接影响。叠加单只审前置提交之后的 diff。派审动作标 `fullReReview` 时做全量复审。
+必改项和遗留建议须标明等级（P0/P1/P2），能从支持的业务入口触发，并有源码调用链或运行证据。写清用户实际看到什么、期望是什么、为何受影响。风格偏好或缺乏可达入口的疑点留作线索，不评级、不打回。熔断前（累计打回 < `rejectFuseCount`，默认 2）P0/P1/P2 均可打回：尚未打回时全单深审、问题尽量一次挖透；打回后的复审核上轮必改项与直接影响面；叠加单只审前置提交之后的 diff。当 `dispatch-review` 返回 `fullReReview: true`（累计打回达到 `rejectFuseCount`）时仍做全量复审，但只就 P0、P1 打回，P2 只能写进 `--remaining` 遗留建议（只剩 P2 时给「通过」并带遗留建议，通过后仍交人裁决）。
 
 发布前填写实际轮次、派审时的完整 SHA 和本会话标识。下面是六项均已核验且均未命中时的命令。
 
@@ -34,25 +34,31 @@ node scripts/forge.mjs verdict --run "$run_file" --dispatch-id "$dispatch_id" --
   --risk contract=0,hotFile=0,migration=0,switchDefault=0,signature=0,foundation=0
 ```
 
-命中的风险项填 `1`。六项依次是改契约或对外接口、改删公共热点或其他槽位文件的已有内容、表结构或存量数据迁移、改开关默认值或关闭时的存量逻辑、改其他槽位或关联仓使用的方法签名、改地基或公共构建配置。文件末尾追加需声明。按需要加 `--must-fix "$must_fix"` 和 `--keep "$keep"`。
+命中的风险项填 `1`。六项依次是改契约或对外接口、改删公共热点或其他槽位文件的已有内容、表结构或存量数据迁移、改开关默认值或关闭时的存量逻辑、改其他槽位或关联仓使用的方法签名、改地基或公共构建配置。文件末尾追加需声明。按需要加 `--must-fix "$must_fix"`、`--remaining "$remaining"` 和 `--keep "$keep"`。
 
-用 `--conclusion 打回` 时须传 `--must-fix`。按行首编号或 `- ` 分条，每条都填实「入口：」和「证据：」，规则见 [终审角色](roles.md#final-reviewer)。字段缺失或仅有 Markdown 强调符时报 `MUST_FIX_INCOMPLETE`，结论不落地。「通过」结论可省略 `--must-fix`。
+用 `--conclusion 打回` 时须传 `--must-fix`。按行首编号或 `- ` 分条，每条须以 `【P0】`/`【P1】`/`【P2】`（也接受 `P0：` 等写法，脚本归一成 `【P0】`）开头并填实「入口：」和「证据：」，规则见 [终审角色](roles.md#final-reviewer)。字段缺失或仅有 Markdown 强调符时报 `MUST_FIX_INCOMPLETE`，缺等级报 `MUST_FIX_GRADE_MISSING`，熔断后必改项含 P2 报 `MUST_FIX_P2_AFTER_FUSE`，结论均不落地。「通过」结论只能省略 `--must-fix` 或填「无」（否则报 `PASS_WITH_MUST_FIX`）。通过与打回均可传 `--remaining` 登记遗留建议（可选，默认「无」）；遗留建议同样按条带等级、入口和证据，仅允许 P2，出现 P0/P1 报 `REMAINING_GRADE_TOO_HIGH`，与必改项重复报 `DUPLICATE_REVIEW_ITEM`，不阻塞合入，只计入终审评论和归档指标。
 
 ```bash
 must_fix=$(cat <<'EOF'
-1. 订单提交空商品列表时返回 500，期望返回 400 并提示商品不能为空
+1. 【P0】订单提交空商品列表时返回 500，期望返回 400 并提示商品不能为空
    入口：下单页点击「提交」→ POST /api/orders
    证据：src/order/create.ts:42 直接读取 body.items[0].sku 未判空，传入 {"items":[]} 抛出 TypeError
-2. 取消订单后库存未回滚，导致可售数持续偏低
+2. 【P1】取消订单后库存未回滚，导致可售数持续偏低
    入口：订单详情点击「取消订单」→ POST /api/orders/:id/cancel
    证据：src/order/cancel.ts:18 仅更新订单状态，未调用 inventoryService.release
+EOF
+)
+remaining=$(cat <<'EOF'
+1. 【P2】空态文案未区分无权限与无数据
+   入口：订单列表页 GET /orders
+   证据：src/order/list.tsx:18 统一渲染「暂无数据」
 EOF
 )
 node scripts/forge.mjs verdict --run "$run_file" --dispatch-id "$dispatch_id" --nonce "$nonce" \
   --forge "$forge" --repo "$repo" --id "$change_id" \
   --round "$round" --conclusion 打回 --head-sha "$head_sha" --session "$review_session" --slot "$slot" \
   --risk contract=0,hotFile=0,migration=0,switchDefault=0,signature=0,foundation=0 \
-  --must-fix "$must_fix" --keep "保留原有支付回调签名校验逻辑"
+  --must-fix "$must_fix" --remaining "$remaining" --keep "保留原有支付回调签名校验逻辑"
 ```
 
 命令先核对本机当前派审、nonce、轮次、会话和 Forge 上的完整 head SHA，再登记结论、发审计评论。发布失败时，下次 `tick --apply` 补发。也可用 `forge.mjs verdict --republish --run <运行态路径> --forge <forge> --repo <repo> --id <变更编号> --dispatch-id <派审 ID>` 补发已登记的正文。评论仅供审计，合入由同一次 `verdict` 按本机登记和实时门禁决定。
