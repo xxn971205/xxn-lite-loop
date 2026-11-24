@@ -2337,7 +2337,7 @@ function scenarioTick(tmp) {
   resetWithReviews(headState(['待终审']));
   const dispatchPost = startReview('github', 'controller', 'reviewer-a');
   const record = dispatchPost.json;
-  const validMustFix = ['--must-fix', '1. 必改项示例\n入口：POST /api/orders\n证据：src/order.js:10 未校验空值'];
+  const validMustFix = ['--must-fix', '1. 【P1】必改项示例\n入口：POST /api/orders\n证据：src/order.js:10 未校验空值'];
   const wrongNonce = finishReview('github', record, '通过', 10, ['--nonce', 'incorrect']);
   const reviewPost = finishReview('github', record, '通过', 10, ['--keep', '保留默认逻辑']);
   const duplicate = finishReview('github', record, '打回', 10, validMustFix);
@@ -2500,7 +2500,7 @@ function scenarioTick(tmp) {
   resetWithReviews(queuedGitLab);
   const glDispatch = startReview('gitlab', 'dispatch', 'gitlab-review');
   const glReview = finishReview('gitlab', glDispatch.json, '打回', 10, [
-    '--slot', 'A', '--must-fix', '1. 修复空值\n入口：POST /api/orders\n证据：src/order.js:12 未判空',
+    '--slot', 'A', '--must-fix', '1. 【P1】修复空值\n入口：POST /api/orders\n证据：src/order.js:12 未判空',
   ]);
   const glNotes = readJson(fake.env.FAKE_FORGE_STATE).comments?.['projects/acme%2Floop/merge_requests/10/notes']?.[0] ?? [];
   eq('R27 派审评论由调度实际会话签名', glNotes[0]?.body.split('\n')[0], '主研发调度 ｜ 主研发 ｜ disp-1');
@@ -2585,7 +2585,7 @@ function scenarioTick(tmp) {
     const beforeFailure = readJson(fake.env.FAKE_FORGE_STATE);
     resetForge({ ...beforeFailure, failApi: [changeNotes(10)] });
     const failedPublish = finishReview('github', unpublished, conclusion, 10, [
-      '--must-fix', '1. 保存待发布正文\n入口：POST /api/orders\n证据：src/order.js:20 实测复现',
+      '--must-fix', '1. 【P1】保存待发布正文\n入口：POST /api/orders\n证据：src/order.js:20 实测复现',
     ]);
     const afterFailure = readJson(fake.env.FAKE_FORGE_STATE);
     delete afterFailure.failApi;

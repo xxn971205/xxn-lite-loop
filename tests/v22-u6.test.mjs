@@ -322,10 +322,10 @@ try {
   test('完整多条编号打回正常发布评论、切需修改并写入本地日志', () => {
     const disp = setupDispatched('rev-valid-numbered');
     const mustFix = [
-      '1. 订单提交空商品列表时返回 500，期望返回 400',
+      '1. 【P0】订单提交空商品列表时返回 500，期望返回 400',
       '   入口：下单页点击「提交」→ POST /api/orders',
       '   证据：src/order/create.ts:42 直接读 body.items[0].sku 未判空',
-      '2. 取消订单后库存未回滚',
+      '2. 【P1】取消订单后库存未回滚',
       '   入口：订单详情点击「取消订单」→ POST /api/orders/:id/cancel',
       '   证据：src/order/cancel.ts:18 未调用 inventoryService.release',
     ].join('\n');
@@ -346,8 +346,8 @@ try {
   test('完整「- 」单行内联打回（含半角冒号）正常发布', () => {
     const disp = setupDispatched('rev-valid-bullets');
     const mustFix = [
-      '- 空值未校验。入口: POST /api/orders；证据: src/order.ts:42 抛出 TypeError',
-      '- 缺幂等键。**入口：**支付回调 /webhook/pay；__证据__：src/pay.ts:88 重复扣款',
+      '- 【P0】空值未校验。入口: POST /api/orders；证据: src/order.ts:42 抛出 TypeError',
+      '- P1：缺幂等键。**入口：**支付回调 /webhook/pay；__证据__：src/pay.ts:88 重复扣款',
     ].join('\n');
     const res = callVerdict(disp, '打回', ['--must-fix', mustFix]);
     assert.equal(res.code, 0, res.stdout);

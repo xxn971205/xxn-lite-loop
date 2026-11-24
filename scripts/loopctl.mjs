@@ -45,7 +45,7 @@ import { activeSlotClaims, forgeSlotClaims, slotKey } from './lib/slot-claims.mj
 import { runNotification } from './lib/outbox.mjs';
 import { verifyGroup } from './lib/lark-im.mjs';
 
-const VERSION = '2.2.0';
+const VERSION = '2.3.0';
 const SKILL_NAME = 'xxn-lite-loop';
 const DEFAULT_WORK_HOURS = { start: '09:00', end: '19:00', timezone: 'Asia/Shanghai' };
 const BASE_LABELS = ['待终审', '终审中', '待合并', '需修改', '阻断', '风险高', '风险低', 'bug'];
@@ -2040,7 +2040,7 @@ function teardownChecklist(run, facts, closingSummary, metrics, localLedgerKey) 
     })
     : [];
   const reviewSummary = metrics.changes === null ? '未核实'
-    : `${metrics.changes} 个变更单 / 累计打回 ${metrics.rejects} 次`;
+    : `${metrics.changes} 个变更单 / 累计打回 ${metrics.rejects} 次 / 分级合计 P0 ${metrics.grades.p0} · P1 ${metrics.grades.p1} · P2 ${metrics.grades.p2}`;
   const ledgers = ledgerTargets.map((ledger) => {
     const issue = String(ledger.id);
     const slot = ledger.key.startsWith('slot:') ? ledger.key.slice(5) : '主研发';
@@ -2136,11 +2136,17 @@ function teardownMetrics(runPath) {
   let reviews;
   try { reviews = readReviews(runPath); } catch { reviews = null; }
   const { scriptComments, tickHistoryError } = readTickHistory(runPath, { requireLog: true });
+  const grades = reviews ? reviews.reduce((sum, { verdict }) => ({
+    p0: sum.p0 + (verdict?.grades?.p0 ?? 0),
+    p1: sum.p1 + (verdict?.grades?.p1 ?? 0),
+    p2: sum.p2 + (verdict?.grades?.p2 ?? 0),
+  }), { p0: 0, p1: 0, p2: 0 }) : null;
   return {
     changes: reviews ? new Set(reviews.map(({ pr }) => issueRef(pr))).size : null,
     rejects: reviews?.filter(({ verdict }) => verdict?.conclusion === '打回').length ?? null,
     fuses: reviews ? new Set(reviews.filter(({ merge }) => hasRejectFuse(merge)).map(({ pr }) => issueRef(pr))).size : null,
     timeouts: tickHistoryError ? null : scriptComments.filter(({ code }) => code === 'REVIEW_TIMEOUT').length,
+    grades,
   };
 }
 

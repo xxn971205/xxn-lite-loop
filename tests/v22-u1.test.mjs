@@ -169,7 +169,7 @@ try {
     const fin = runLoopctl(['teardown', '--req', req, '--finalize', '--results', '{}'], configDir, fake.env);
     assert.equal(fin.code, 0, fin.stderr);
 
-    const expected = { changes: 3, rejects: 2, fuses: 2, timeouts: 2 };
+    const expected = { changes: 3, rejects: 2, fuses: 2, timeouts: 2, grades: { p0: 0, p1: 0, p2: 0 } };
     const archive = JSON.parse(fs.readFileSync(fin.json.archivePath, 'utf8'));
     assert.deepEqual(archive.teardown.metrics, expected);
     assert.deepEqual(fin.json.metrics, expected);
@@ -192,7 +192,7 @@ try {
     assert.equal(fin.code, 0, fin.stderr);
 
     const archive = JSON.parse(fs.readFileSync(fin.json.archivePath, 'utf8'));
-    assert.deepEqual(archive.teardown.metrics, { changes: 0, rejects: 0, fuses: 0, timeouts: null });
+    assert.deepEqual(archive.teardown.metrics, { changes: 0, rejects: 0, fuses: 0, timeouts: null, grades: { p0: 0, p1: 0, p2: 0 } });
   });
 
   test('teardown --finalize writes zero timeouts when the tick journal has no emitted timeouts', () => {
@@ -223,7 +223,7 @@ try {
     assert.equal(fin.code, 0, fin.stderr);
 
     const archive = JSON.parse(fs.readFileSync(fin.json.archivePath, 'utf8'));
-    assert.deepEqual(archive.teardown.metrics, { changes: null, rejects: null, fuses: null, timeouts: null });
+    assert.deepEqual(archive.teardown.metrics, { changes: null, rejects: null, fuses: null, timeouts: null, grades: null });
   });
 } finally {
   fs.rmSync(TMP, { recursive: true, force: true });

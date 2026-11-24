@@ -27,7 +27,7 @@ import { formatScriptComment } from './lib/action-messages.mjs';
 import { dispatchSlot, scopedChanges } from './lib/tick-dispatch.mjs';
 import { activeSlotClaims, forgeSlotClaims, slotKey } from './lib/slot-claims.mjs';
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 const GLAB = process.env.GLAB_BIN || 'glab';
 const GH = process.env.GH_BIN || 'gh';
 const GIT = process.env.GIT_BIN || 'git';
@@ -584,27 +584,44 @@ function verdictRisk(value) {
   return risk;
 }
 
-function validateMustFix(text) {
+const GRADE_PREFIX = /^((?:\d+(?:\.(?!\d)|[、)）])|-[ \t])[ \t]*)?(?:[*_]{1,2})?(?:【(P[012])】|\[(P[012])\]|(P[012])(?=(?:[*_]{1,2})?[：:\s\-—]))(?:[*_]{1,2})?(?:[ \t]*[：:\-—][ \t]*|[ \t]+)?(?:[*_]{1,2})?[ \t]*/i;
+
+function parseReviewItems(text, label = '必改项') {
   const lines = String(text).split(/\r\n?|\n/);
   const indent = lines.reduce((min, line) => line.trim() ? Math.min(min, line.match(/^[ \t]*/)[0].length) : min, Infinity);
   const items = lines.map((line) => line.slice(indent)).join('\n')
     .split(/\n(?=\d+(?:\.(?!\d)|[、)）])|-[ \t])/).map((item) => item.trim()).filter(Boolean);
   const incomplete = [];
+  const missingGrade = [];
+  const grades = { p0: 0, p1: 0, p2: 0 };
+  const parsed = [];
   items.forEach((item, idx) => {
+    const headline = item.split('\n')[0].trim();
+    const short = headline.length > 80 ? `${headline.slice(0, 80)}…` : headline;
     const fields = new Set();
     for (const [, field, content] of item.replace(/[*_]/g, '').matchAll(/(入口|证据)[：:]([\s\S]*?)(?=(?:入口|证据)[：:]|$)/g)) {
       if (content.replace(/[\s；;，,。、|｜\-—]+/g, '')) fields.add(field);
     }
     const missing = ['入口', '证据'].filter((field) => !fields.has(field)).map((field) => `${field}：`);
-    if (missing.length) {
-      const headline = item.split('\n')[0].trim();
-      incomplete.push({ index: idx + 1, item: headline.length > 80 ? `${headline.slice(0, 80)}…` : headline, missing });
+    if (missing.length) incomplete.push({ index: idx + 1, item: short, missing });
+    const match = GRADE_PREFIX.exec(item);
+    if (!match) {
+      missingGrade.push({ index: idx + 1, item: short });
+      return;
     }
+    const grade = (match[2] ?? match[3] ?? match[4]).toLowerCase();
+    grades[grade] += 1;
+    parsed.push({ index: idx + 1, item: short, grade, text: `${match[1] ?? ''}【${grade.toUpperCase()}】${item.slice(match[0].length)}` });
   });
   if (!items.length || incomplete.length) {
     const detail = incomplete.map(({ index, item, missing }) => `第 ${index} 条（${item}）缺${missing.join('、')}`).join('；');
-    throw new CliError('MUST_FIX_INCOMPLETE', `打回的每条必改项必须同时包含「入口：」和「证据：」${detail ? `：${detail}` : ''}`, { incomplete });
+    throw new CliError('MUST_FIX_INCOMPLETE', `${label}的每条必须同时包含「入口：」和「证据：」${detail ? `：${detail}` : ''}`, { incomplete });
   }
+  if (missingGrade.length) {
+    const detail = missingGrade.map(({ index, item }) => `第 ${index} 条（${item}）`).join('；');
+    throw new CliError('MUST_FIX_GRADE_MISSING', `${label}的每条必须以【P0】、【P1】或【P2】开头：${detail}`, { missingGrade });
+  }
+  return { text: parsed.map((entry) => entry.text).join('\n'), grades, items: parsed };
 }
 
 export function publishVerdict(run, runPath, dispatch) {
@@ -642,16 +659,34 @@ function changeVerdict(ctx, flags) {
   const nonce = required(flags, 'nonce');
   const reviewText = (key, needed = false) => !needed && flags[key] === undefined ? '无'
     : required(flags, key).replace(/<!--(?=\s*liteloop:verdict\b)/g, '&lt;!--').replaceAll(nonce, '[已隐藏]');
-  const mustFix = reviewText('must-fix', conclusion === '打回');
-  if (conclusion === '打回') validateMustFix(mustFix);
+  const rawMustFix = reviewText('must-fix', conclusion === '打回');
+  const mustFixParsed = conclusion === '打回' ? parseReviewItems(rawMustFix, '必改项') : null;
+  const mustFix = mustFixParsed ? mustFixParsed.text : rawMustFix;
+  const rawRemaining = reviewText('remaining');
+  const remainingParsed = rawRemaining.trim() === '无' ? null : parseReviewItems(rawRemaining, '遗留建议');
+  if (remainingParsed && (remainingParsed.grades.p0 > 0 || remainingParsed.grades.p1 > 0)) {
+    const high = remainingParsed.items.filter(({ grade }) => grade !== 'p2');
+    const detail = high.map(({ index, item }) => `第 ${index} 条（${item}）`).join('；');
+    throw new CliError('REMAINING_GRADE_TOO_HIGH', `遗留建议仅允许 P2，P0/P1 必须打回：${detail}`, {
+      items: high.map(({ index, item, grade }) => ({ index, item, grade: grade.toUpperCase() })),
+    });
+  }
+  const remaining = remainingParsed ? remainingParsed.text : '无';
+  const grades = {
+    p0: (mustFixParsed?.grades.p0 ?? 0) + (remainingParsed?.grades.p0 ?? 0),
+    p1: (mustFixParsed?.grades.p1 ?? 0) + (remainingParsed?.grades.p1 ?? 0),
+    p2: (mustFixParsed?.grades.p2 ?? 0) + (remainingParsed?.grades.p2 ?? 0),
+  };
   const body = [
     `终审 ｜ ${slot} ｜ ${session}`,
     `结论：${conclusion}（第 ${round} 轮）`,
+    `问题分级：P0 ${grades.p0} · P1 ${grades.p1} · P2 ${grades.p2}`,
     '必改项：', mustFix,
+    '遗留建议：', remaining,
     '不要改动的范围：', reviewText('keep'),
     `风险：${Object.values(risk).some(Boolean) ? '高' : '低'}`,
     ...RISK_RULES.map(({ key, label }, index) => `${index + 1}. ${label}：${risk[key] ? '是' : '否'}`),
-    '', `<!-- liteloop:verdict ${JSON.stringify({ dispatchId, round, conclusion, risk, headSha, session })} -->`,
+    '', `<!-- liteloop:verdict ${JSON.stringify({ dispatchId, round, conclusion, risk, grades, headSha, session })} -->`,
   ].join('\n');
   return withReviewRun(ctx, flags, (runPath, run, pr) => {
     const history = reviewsFor(readReviews(runPath), pr);
@@ -667,9 +702,26 @@ function changeVerdict(ctx, flags) {
     if (!live.labels.includes('终审中') || live.labels.includes('待终审')) {
       throw new CliError('REVIEW_NOT_ACTIVE', '变更单没有可登记结论的当前派审，请核对终审状态');
     }
-    dispatch.verdict = { type: 'verdict', dispatchId, conclusion, risk, body };
-    appendReview(runPath, dispatch.verdict);
     const member = !changeMembership(run, live);
+    if (mustFixParsed?.grades.p2 > 0) {
+      const fuseCount = run.thresholds?.rejectFuseCount ?? 2;
+      let priorRejects = resolveReviewState(history, [], headSha).rejectCount;
+      if (priorRejects < fuseCount && member) {
+        try {
+          const priorNotes = readComments(ctx, commentsEndpoint(ctx, 'change', pr.repo, pr.id));
+          priorRejects = resolveReviewState(history, priorNotes, headSha).rejectCount;
+        } catch { /* Fall back to local reject history. */ }
+      }
+      if (priorRejects >= fuseCount) {
+        const p2Items = mustFixParsed.items.filter(({ grade }) => grade === 'p2');
+        const detail = p2Items.map(({ index, item }) => `第 ${index} 条（${item}）`).join('；');
+        throw new CliError('MUST_FIX_P2_AFTER_FUSE',
+          `已累计打回 ${priorRejects} 次（达到熔断阈值 ${fuseCount}），熔断后必改项不能包含 P2，请改写到 --remaining（只剩 P2 时请给「通过」）：${detail}`,
+          { rejectCount: priorRejects, rejectFuseCount: fuseCount, items: p2Items.map(({ index, item }) => ({ index, item })) });
+      }
+    }
+    dispatch.verdict = { type: 'verdict', dispatchId, conclusion, risk, grades, body };
+    appendReview(runPath, dispatch.verdict);
     const publication = { auditPending: !member };
     if (member) {
       try {
@@ -684,13 +736,13 @@ function changeVerdict(ctx, flags) {
     }
     const { rejectCount } = resolveReviewState(history, notes, headSha);
     if (conclusion === '打回') {
-      const result = { ok: true, dispatchId, conclusion, state: 'rejected', code: 'REVIEW_REJECTED', rejectCount, ...publication };
+      const result = { ok: true, dispatchId, conclusion, grades, state: 'rejected', code: 'REVIEW_REJECTED', rejectCount, ...publication };
       if (member) applyVerdictLabels(ctx, pr, live, result);
       else result.message = '变更目标已离开需求基线，请人工处理打回结论。';
       return result;
     }
     const result = mergeReviewedChange(ctx, runPath, run, dispatch, rejectCount, { live });
-    return { ...result, ok: true, dispatchId, conclusion, rejectCount, ...publication };
+    return { ...result, ok: true, dispatchId, conclusion, grades, rejectCount, ...publication };
   });
 }
 
@@ -2288,7 +2340,7 @@ function usage() {
       'change-label --forge <f> --repo <...> --id <num> [--add a,b] [--remove c]',
       'change-comment --forge <f> --repo <...> --id <num> --body <text>',
       'dispatch-review --run <run.json> --role controller|dispatch --forge <f> --repo <...> --id <num> --head-sha <40位> --session <新终审会话标识> [--by <派审会话标识>]（dispatch 必填 --by）',
-      'verdict --run <run.json> --dispatch-id <id> --nonce <nonce> --forge <f> --repo <...> --id <num> --round <n> --conclusion 通过|打回 --risk contract=0,hotFile=0,migration=0,switchDefault=0,signature=0,foundation=0 --head-sha <40位> --session <id> [--slot <槽位>] [--must-fix <text>（打回必填，每条须含「入口：」和「证据：」）] [--keep <text>]',
+      'verdict --run <run.json> --dispatch-id <id> --nonce <nonce> --forge <f> --repo <...> --id <num> --round <n> --conclusion 通过|打回 --risk contract=0,hotFile=0,migration=0,switchDefault=0,signature=0,foundation=0 --head-sha <40位> --session <id> [--slot <槽位>] [--must-fix <text>（打回必填，每条须以【P0】/【P1】/【P2】开头并含「入口：」和「证据：」，熔断后禁 P2）] [--remaining <text>（可选，仅允许【P2】并含「入口：」和「证据：」）] [--keep <text>]',
       'acceptance --run <run.json> --conclusion 通过|不通过 --report <文本或链接> --model <验收模型> --session <id>',
       'change-merge --forge <f> --repo <...> --id <num> --head-sha <sha> --target <需求基线> [--run <run.json>] [--repo-path <dir>] [--baseline-start-sha <sha>] [--require-lineage] [--require-issue-ref] [--protected-branches a,b] [--depends-on <json>]',
       'labels-sync --forge <f> --repos <r1,r2> [--req <slug>] [--labels a,b,c | --slots 主研发,A,B] [--overwrite（仅 GitHub）]',
