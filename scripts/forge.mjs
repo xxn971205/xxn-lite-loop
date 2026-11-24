@@ -587,7 +587,8 @@ function verdictRisk(value) {
   return risk;
 }
 
-const GRADE_PREFIX = /^((?:\d+(?:\.(?!\d)|[、)）])|-[ \t])[ \t]*)?(?:(\*{1,2}|_{1,2})(?:【(P[012])】|\[(P[012])\]|(P[012])[：:]?)\2(?:[ \t]*[：:][ \t]*|[ \t]+)?|(?:【(P[012])】|\[(P[012])\])(?:[ \t]*[：:][ \t]*|[ \t]+)?|(P[012])(?:[：:][ \t]*|[ \t]+(?:[-—][ \t]+)?|(?=\n)))/i;
+const GRADE_PREFIX = /^((?:\d+(?:\.(?!\d)|[、)）])|-[ \t])[ \t]*)?(?:(\*{1,2}|_{1,2})(?:(?:【(P[012])】|\[(P[012])\]|(P[012])[：:])\2[ \t]*|(P[012])\2(?:[ \t]*[：:][ \t]*|[ \t]+)?)|(?:【(P[012])】|\[(P[012])\])[ \t]*|(P[012])(?:[：:][ \t]*|[ \t]+(?:[-—][ \t]+)?|(?=\n)))/i;
+const FIELD_LABEL = /(?:(\*{1,2}|_{1,2})(入口|证据)(?:\1[：:]|[：:]\1)|(入口|证据)[：:])[ \t]*/g;
 
 function parseReviewItems(text, label = '必改项') {
   const lines = String(text).split(/\r\n?|\n/);
@@ -615,7 +616,8 @@ function parseReviewItems(text, label = '必改项') {
     const grade = match.slice(3).find(Boolean).toLowerCase();
     grades[grade] += 1;
     const normalizedBody = `【${grade.toUpperCase()}】${item.slice(match[0].length)}`;
-    const key = normalizedBody.split('\n').map((line) => line.trim()).filter(Boolean).join('\n');
+    const key = normalizedBody.replace(FIELD_LABEL, (_, _em, a, b) => `${a ?? b}：`)
+      .split('\n').map((line) => line.trimEnd()).filter(Boolean).join('\n');
     parsed.push({ index: idx + 1, item: short, grade, key, text: `${match[1] ?? ''}${normalizedBody}` });
   });
   if (!items.length || incomplete.length) {
@@ -662,8 +664,8 @@ function changeVerdict(ctx, flags) {
   if (/[\r\n｜|]/.test(slot)) throw new CliError('INVALID_SLOT', '--slot 不能含换行或分隔符');
   const dispatchId = required(flags, 'dispatch-id');
   const nonce = required(flags, 'nonce');
-  const reviewText = (key, needed = false) => !needed && flags[key] === undefined ? '无'
-    : required(flags, key).replace(/<!--(?=\s*liteloop:verdict\b)/g, '&lt;!--').replaceAll(nonce, '[已隐藏]');
+  const reviewText = (key, needed = false) => (needed ? required(flags, key) : optional(flags, key, '无'))
+    .replace(/<!--(?=\s*liteloop:verdict\b)/g, '&lt;!--').replaceAll(nonce, '[已隐藏]');
   const rawMustFix = reviewText('must-fix', conclusion === '打回');
   if (conclusion === '通过' && rawMustFix.trim() !== '无') {
     throw new CliError('PASS_WITH_MUST_FIX', '结论为「通过」时 --must-fix 只能省略或填「无」；P2 遗留建议请放进 --remaining，有 P0/P1 请改为「打回」');
@@ -1588,6 +1590,10 @@ export function readLinkedOwnership(run, master) {
   const location = file.split('/').map(encodeURIComponent).join('/');
   return runProcess(gh(ctx, ['api', '--header', 'Accept: application/vnd.github.raw+json',
     `repos/${repo}/contents/${location}?ref=${encodeURIComponent(ref)}`]));
+}
+
+export function readChangeComments(run, change) {
+  return commentsWithReplies(runForgeContext(run), 'change', change.repo, change.id);
 }
 
 export function readChangeLabelEvents(run, change) {

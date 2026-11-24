@@ -2867,7 +2867,15 @@ function cmdBrief(flags) {
   const changeArg = optFlag(flags, 'change');
   const reviews = changeArg ? readReviews(runPath) : [];
   const changeRef = changeArg ? briefRef(run, changeArg, 'change', [...(run.changes ?? []), ...reviews.map(({ pr }) => pr)]) : null;
-  const rejectCount = changeRef ? resolveReviewState(reviewsFor(reviews, changeRef), [], null).rejectCount : 0;
+  const changeReviews = changeRef ? reviewsFor(reviews, changeRef) : [];
+  const activeDispatch = changeReviews.at(-1) && !changeReviews.at(-1).verdict ? changeReviews.at(-1) : null;
+  const rejectCount = changeRef
+    ? (Array.isArray(activeDispatch?.rejectDispatchIds)
+      ? activeDispatch.rejectDispatchIds.length
+      : resolveReviewState(changeReviews, [], null).rejectCount)
+    : 0;
+  const fuseCount = run.thresholds?.rejectFuseCount ?? 2;
+  const fullReReview = Boolean(changeRef && rejectCount >= fuseCount);
 
   const models = run.roleModels ?? {};
   const coderModel = normModel(models.coder);
@@ -2898,11 +2906,18 @@ function cmdBrief(flags) {
     ?? (run.hubRepo?.repo?.toLowerCase() === repo.toLowerCase() ? run.hubRepo : null);
   const baseline = run.baselineBranch ?? run.branch ?? null;
 
+  const reviewScopeLine = role === 'finalReviewer' && changeRef
+    ? (fullReReview
+      ? `终审口径：已熔断（已打回 ${rejectCount} 次，fullReReview=true，全量复审）；仅允许就 P0/P1 打回，P2 只能写进 --remaining 遗留建议（只剩 P2 请给「通过」），通过后仍交人裁决`
+      : `终审口径：未熔断（已打回 ${rejectCount} 次，fullReReview=false，${rejectCount === 0 ? '首轮深审' : '普通复审'}）；P0/P1/P2 均可打回，熔断后（累计打回 ≥ ${fuseCount} 次）P2 只能写进 --remaining 遗留建议`)
+    : null;
+
   return [
     `开工前先读 ${path.join(SKILL_ROOT, 'references', 'roles.md')}#${roleMeta.anchor}`,
     `需求：${run.req ?? '未配置'}`,
     `子 Issue：#${issueRef.id}（${issueRef.url}）`,
     ...(changeRef ? [`变更单：${changeRef.url}${rejectCount > 0 ? `（已打回 ${rejectCount} 次）` : ''}`] : []),
+    ...(reviewScopeLine ? [reviewScopeLine] : []),
     `仓库：${repo}`,
     `基线分支：${baseline ?? '未配置'}`,
     `基线 SHA：${fetchBaselineSha(entry?.path, baseline)}`,

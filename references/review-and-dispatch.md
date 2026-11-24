@@ -21,9 +21,9 @@ L3 的 `--by` 必填，传派审方调度会话的实际标识，供公开评论
 
 自建 Forge 实例在 `dispatch-review` 和 `verdict` 中都传运行态对应的 `--hostname`。`dispatch-review` 写入本机登记簿、发布派审评论并切换到「终审中」。
 
-用 `loopctl.mjs brief` 生成任务说明，另附 `dispatch-review` 返回的 `dispatchId`、`nonce`、`round`、`headSha` 和 `session`。nonce 只交独立终审。终审在派审方本机运行，重读 PR/MR 确认候选 SHA 后发一次结论。
+`tick` 的 `review-dispatch` 动作只作为「需要派审」的触发信号，不作为审查范围和熔断口径的依据；本轮累计打回次数和是否熔断一律以 `dispatch-review` 返回并落盘的 `rejectCount` 和 `fullReReview` 为准。登记派审后，用 `loopctl.mjs brief --run "$run_file" --role finalReviewer --issue <子Issue> --change <PR/MR>` 生成终审任务开头（自动带出 `dispatch-review` 登记的 `rejectCount`、`fullReReview`、是否已熔断及「熔断后 P2 只能写进 `--remaining` 遗留建议」的要求），另附 `dispatch-review` 返回的 `dispatchId`、`nonce`、`round`、`headSha`、`session`、`rejectCount` 和 `fullReReview`。nonce 只交独立终审。终审在派审方本机运行，重读 PR/MR 确认候选 SHA 后发一次结论。
 
-必改项和遗留建议须标明等级（P0/P1/P2），能从支持的业务入口触发，并有源码调用链或运行证据。写清用户实际看到什么、期望是什么、为何受影响。风格偏好或缺乏可达入口的疑点留作线索，不评级、不打回。前 2 轮为深审，问题尽量一次挖透；普通复审核必改项和直接影响；叠加单只审前置提交之后的 diff。累计打回达到 `rejectFuseCount`（默认 2）后，派审动作标 `fullReReview` 时仍做全量复审，但只就 P0、P1 打回，P2 改写到 `--remaining`（只剩 P2 时给「通过」并带遗留建议，通过后仍交人裁决）。
+必改项和遗留建议须标明等级（P0/P1/P2），能从支持的业务入口触发，并有源码调用链或运行证据。写清用户实际看到什么、期望是什么、为何受影响。风格偏好或缺乏可达入口的疑点留作线索，不评级、不打回。前 2 轮为深审，问题尽量一次挖透；普通复审核必改项和直接影响；叠加单只审前置提交之后的 diff。当 `dispatch-review` 返回 `fullReReview: true`（累计打回达到 `rejectFuseCount`，默认 2）时仍做全量复审，但只就 P0、P1 打回，P2 只能写进 `--remaining` 遗留建议（只剩 P2 时给「通过」并带遗留建议，通过后仍交人裁决）。
 
 发布前填写实际轮次、派审时的完整 SHA 和本会话标识。下面是六项均已核验且均未命中时的命令。
 

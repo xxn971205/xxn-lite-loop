@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { CliError, factFailure, ENV_BRANCHES, isEnvironmentSource, matchProtectedBranch, splitPatterns, withFileLock, tickLockPath, acceptanceEnabled, parseAcceptanceComments } from './common.mjs';
 import {
   applyTickIssueBody, applyTickReviewLabels, collectRunFacts, postTickComment, publishVerdict, retryReviewedMerge,
-  readChangeFiles, readChangeLabelEvents, readLinkedOwnership, readAcceptanceBaseline,
+  readChangeComments, readChangeFiles, readChangeLabelEvents, readLinkedOwnership, readAcceptanceBaseline,
 } from '../forge.mjs';
 import { FULL_SHA, readReviews, reviewsFor } from './review-journal.mjs';
 import { hasRejectFuse, isWaitingMerge, resolveReviewState, reviewLabelPlan } from './review-state.mjs';
@@ -667,9 +667,18 @@ function planReviews(snapshot, changes, planQueue = true) {
       });
       continue;
     }
-    const review = resolveReviewState(history, change.comments, change.headSha);
-    const fullReReview = review.rejectCount >= thresholds.rejectFuseCount;
     const inReview = change.labels.includes('终审中') && !change.labels.includes('待终审');
+    let comments = change.comments;
+    if (!inReview && snapshot.skippedComments.has(ref)) {
+      try {
+        comments = readChangeComments(snapshot.run, change);
+      } catch (error) {
+        snapshot.reviewErrors.push(factError(factFailure(`change:${ref}:comments`, error)));
+        continue;
+      }
+    }
+    const review = resolveReviewState(history, comments, change.headSha);
+    const fullReReview = review.rejectCount >= thresholds.rejectFuseCount;
     if (!inReview) {
       if (FULL_SHA.test(change.headSha)) actions.push(action('review-dispatch', fullReReview ? '派全量重审' : '派独立终审',
         [{ ...noteRef(change), headSha: change.headSha }], REVIEW_DOC, {
@@ -813,11 +822,13 @@ function executeTick(runPath, role, apply, nowMs, lib, { findingsOnly = false, s
   const reviewRole = role === 'controller' && run.tier !== 'L3' || role === 'dispatch' && run.tier === 'L3';
   const reviews = reviewRole ? readReviews(runPath) : undefined;
   const latest = new Map(reviews?.map((row) => [issueRef(row.pr), row]));
+  const skippedComments = new Set();
   const facts = collectRunFacts(run, { skipChangeComments(change) {
     const review = latest.get(issueRef(change));
-    return isWaitingMerge(review, change)
-      || (review?.headSha === change.headSha && review.verdict?.body && !review.commentId
-        && !change.labels.some((label) => FORGE_REVIEW_LABELS.includes(label)));
+    const skip = isWaitingMerge(review, change)
+      || (review?.headSha === change.headSha && review.verdict?.body && !review.commentId);
+    if (skip) skippedComments.add(issueRef(change));
+    return skip;
   } });
   const personalTask = run.scheduledTasks?.find((task) => task.role === (role === 'patrol' ? 'patrol' : 'controller'));
   const slot = run.slot ?? personalTask?.ledgerKey?.match(/^slot:(.+)$/)?.[1] ?? '主研发';
@@ -858,7 +869,7 @@ function executeTick(runPath, role, apply, nowMs, lib, { findingsOnly = false, s
   const offHours = !work.inside;
   const snapshot = {
     run, role, nowMs, localNow: work.now, offHours, win, ctx: { nowMs, win, offHours }, facts, master, personal, slot, ownIssues, ownChanges,
-    runPath, lib, thresholds, reviews, reviewErrors, baseline: run.baselineBranch ?? run.branch, previous, next, actions, effects: [], findings: [], decisions: [], fusedChanges: [],
+    runPath, lib, thresholds, reviews, reviewErrors, skippedComments, baseline: run.baselineBranch ?? run.branch, previous, next, actions, effects: [], findings: [], decisions: [], fusedChanges: [],
     reviewEvents: new Map(), rejectedSources: new Set(), changeFiles: new Map(), ownership: [],
   };
   if (role === 'controller' && personal?.state === 'open') {

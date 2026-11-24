@@ -82,6 +82,7 @@ if (args[0] === 'pr' && args[1] === 'view') {
   reply(pr);
 }
 if (args[0] === 'pr' && args[1] === 'edit') {
+  if (state.failLabelEdit && args[2] === '10') fail('HTTP 503 label update');
   const pr = state.prs[repoArg() + '#' + args[2]];
   if (!pr) fail('not found');
   const remove = args.includes('--remove-label') ? args[args.indexOf('--remove-label') + 1].split(',') : [];
@@ -753,4 +754,172 @@ test('E2E：GitHub L2 三轮派审（P2→P1→tick 全量重审→熔断拒 P2�
   assert.deepEqual(tdFinal.json.metrics.grades, { p0: 0, p1: 1, p2: 2 });
   const archived = JSON.parse(fs.readFileSync(tdFinal.json.archivePath, 'utf8'));
   assert.deepEqual(archived.teardown.metrics.grades, { p0: 0, p1: 1, p2: 2 });
+});
+
+test('回归 R2-1：单张 PR 评论读取 503 只暂停该单派审，不阻塞本机结论补发与同需求其他 PR 派审', (t) => {
+  const p1 = '1. 【P1】负数库存校验错误\n   入口：POST /orders\n   证据：create.ts:18 复现';
+
+  // 场景 A：#10 有待补发结论并重入待终审，#10 评论 GET 503 而 POST 与 #11 正常
+  const f = createFixture(t);
+  const d1 = f.dispatch('r2-outage-10');
+  const sFail = f.readState();
+  sFail.failVerdictPost = true;
+  f.writeState(sFail);
+  const rej = f.verdict(d1, '打回', ['--must-fix', p1]);
+  assert.equal(rej.code, 0, rej.stdout);
+  assert.equal(rej.json.auditPending, true);
+
+  f.requeue();
+  const sOutage = f.readState();
+  sOutage.failVerdictPost = false;
+  sOutage.failReads = true;
+  sOutage.prs[`${REPO}#11`] = { ...sOutage.prs[`${REPO}#10`], headRefName: 'feat/other' };
+  f.writeState(sOutage);
+
+  const tickRes = f.loopctl(['tick', '--req', f.req, '--role', 'controller', '--now', '2026-11-24T05:00:00Z', '--apply']);
+  assert.equal(tickRes.code, 0, tickRes.stdout + tickRes.stderr);
+  const actions = tickRes.json.runs?.[0]?.actions ?? [];
+  assert.ok(readReviews(f.runPath).at(-1).commentId, '应照常补发 #10 的本机结论');
+  assert.ok(actions.some((a) => a.code === 'VERDICT_AUDIT_REPUBLISH' && a.refs?.[0]?.id === 10), JSON.stringify(actions));
+  assert.ok(actions.some((a) => a.kind === 'review-dispatch' && a.code === 'dispatch' && a.refs?.[0]?.id === 11), '应照常为 #11 生成派审');
+  assert.ok(!actions.some((a) => a.kind === 'review-dispatch' && a.code === 'dispatch' && a.refs?.[0]?.id === 10), '应暂停 #10 的派审');
+  assert.ok(actions.some((a) => a.kind === 'facts-error' && a.code === 'EXEC_FAILED'), JSON.stringify(actions));
+
+  // 场景 B：#10 仍挂「终审中」且评论 GET 503 时，本机结论补发与标签修正均不受阻
+  const f2 = createFixture(t);
+  const d2 = f2.dispatch('r2-in-review-10');
+  const s2Fail = f2.readState();
+  s2Fail.failVerdictPost = true;
+  s2Fail.failLabelEdit = true;
+  f2.writeState(s2Fail);
+  const rej2 = f2.verdict(d2, '打回', ['--must-fix', p1]);
+  assert.ok(readReviews(f2.runPath).at(-1).verdict);
+  assert.ok(f2.labels().includes('终审中'));
+
+  const s2Outage = f2.readState();
+  s2Outage.failVerdictPost = false;
+  s2Outage.failLabelEdit = false;
+  s2Outage.failReads = true;
+  f2.writeState(s2Outage);
+  const tickRes2 = f2.loopctl(['tick', '--req', f2.req, '--role', 'controller', '--now', '2026-11-24T05:00:00Z', '--apply']);
+  assert.equal(tickRes2.code, 0, tickRes2.stdout + tickRes2.stderr);
+  assert.ok(readReviews(f2.runPath).at(-1).commentId, '终审中状态也应完成本机结论补发');
+
+  const s2Recover = f2.readState();
+  s2Recover.failReads = false;
+  f2.writeState(s2Recover);
+  const tickRes2Recover = f2.loopctl(['tick', '--req', f2.req, '--role', 'controller', '--now', '2026-11-24T05:05:00Z', '--apply']);
+  assert.equal(tickRes2Recover.code, 0, tickRes2Recover.stdout + tickRes2Recover.stderr);
+  assert.ok(f2.labels().includes('需修改'), 'GET 恢复后应切回需修改');
+});
+
+test('回归 R2-2：tick 与 dispatch-review 之间旧结论补发到达，brief 采用 dispatch-review 的熔断口径', (t) => {
+  const prior = createFixture(t);
+  const current = createFixture(t);
+  const p1 = '1. 【P1】校验缺失\n   入口：POST /orders\n   证据：create.ts:18 复现';
+  const p2 = '1. 【P2】文案优化\n   入口：GET /orders\n   证据：list.ts:18 复现';
+
+  const d1 = prior.dispatch('old-r1');
+  assert.equal(prior.verdict(d1, '打回', ['--must-fix', p1]).json.code, 'REVIEW_REJECTED');
+  prior.requeue();
+
+  const d2 = prior.dispatch('old-r2');
+  const sPrior = prior.readState();
+  sPrior.failVerdictPost = true;
+  prior.writeState(sPrior);
+  assert.equal(prior.verdict(d2, '打回', ['--must-fix', p1]).json.auditPending, true);
+  prior.requeue();
+
+  // 新机器此时只能看到第 1 轮评论，tick 输出 rejectCount=1, fullReReview=false
+  current.writeState(prior.readState());
+  const plan = current.tickDispatch(true);
+  assert.deepEqual([plan.rejectCount, plan.fullReReview], [1, false]);
+
+  // 在 tick 与 dispatch-review 之间，旧机器补发第 2 轮结论到 Forge
+  const sRecover = prior.readState();
+  sRecover.failVerdictPost = false;
+  prior.writeState(sRecover);
+  const pub = spawnSync(process.execPath, [
+    FORGE, 'verdict', '--republish', '--run', prior.runPath,
+    '--forge', 'github', '--repo', REPO, '--id', '10', '--dispatch-id', d2.dispatchId,
+  ], { encoding: 'utf8', env: { ...BASE_ENV, GH_BIN: path.join(path.dirname(prior.configDir), 'fake-gh.mjs'), FAKE_FORGE_STATE: path.join(path.dirname(prior.configDir), 'state.json'), FAKE_FORGE_LOG: path.join(path.dirname(prior.configDir), 'calls.jsonl') } });
+  assert.equal(pub.status, 0, pub.stdout + pub.stderr);
+  current.writeState(prior.readState());
+
+  // dispatch-review 返回 2, true；随后生成的 finalReviewer brief 必须使用 dispatch-review 的口径
+  const d3 = current.dispatch('new-r3');
+  assert.deepEqual([d3.rejectCount, d3.fullReReview], [2, true]);
+
+  const brief = current.loopctl(['brief', '--run', current.runPath, '--role', 'finalReviewer', '--issue', '#15', '--change', '10']);
+  assert.equal(brief.code, 0, brief.stdout + brief.stderr);
+  assert.match(brief.stdout, /已打回 2 次/);
+  assert.match(brief.stdout, /已熔断/);
+  assert.match(brief.stdout, /fullReReview=true/);
+  assert.match(brief.stdout, /--remaining/);
+
+  const blocked = current.verdict(d3, '打回', ['--must-fix', p2]);
+  assert.equal(blocked.code, 2, blocked.stdout);
+  assert.equal(blocked.json.code, 'MUST_FIX_P2_AFTER_FUSE');
+});
+
+test('回归 R2-3：闭合等级标记后紧跟的正文冒号保持原样，裸写等级后的冒号仍作分隔符', (t) => {
+  const f = createFixture(t);
+  const d = f.dispatch('r2-colon');
+  const mustFix = [
+    '1. 【P1】:focus-visible 未生效，键盘导航看不到焦点',
+    '   入口：订单页按 Tab 聚焦提交按钮',
+    '   证据：src/order.css:23，Tab 聚焦后仍没有边框',
+    '2. [P1]:hover 样式被覆盖',
+    '   入口：鼠标悬停提交按钮',
+    '   证据：src/order.css:40 权重不足',
+    '3. P1: :focus-visible 仍被覆盖',
+    '   入口：键盘聚焦按钮',
+    '   证据：src/order.css:50 复现',
+  ].join('\n');
+
+  const res = f.verdict(d, '打回', ['--must-fix', mustFix]);
+  assert.equal(res.code, 0, res.stdout);
+  const body = f.comments().at(-1).body;
+  assert.ok(body.includes('1. 【P1】:focus-visible 未生效，键盘导航看不到焦点'), body);
+  assert.ok(body.includes('2. 【P1】:hover 样式被覆盖'), body);
+  assert.ok(body.includes('3. 【P1】:focus-visible 仍被覆盖'), body);
+});
+
+test('回归 R2-4：入口/证据标签换了 Markdown 强调样式仍判重复并拒收，保留内容与缩进差异', (t) => {
+  const f = createFixture(t);
+  const d = f.dispatch('r2-md-dup');
+  const before = f.snapshot();
+  const base = '1. 【P2】列表空态文案不清\n   入口：GET /orders\n   证据：list.ts:18 空态不区分原因';
+  const styled = '1. P2：列表空态文案不清\n   **入口：**GET /orders\n   __证据__：list.ts:18 空态不区分原因';
+
+  const dup = f.verdict(d, '打回', ['--must-fix', base, '--remaining', styled]);
+  assert.equal(dup.code, 2, dup.stdout);
+  assert.equal(dup.json.code, 'DUPLICATE_REVIEW_ITEM');
+  assert.equal(f.readCalls().length, 0);
+  assert.deepEqual(f.snapshot(), before);
+
+  // 缩进有差异的证据不误判为重复
+  const prefix = '1. 【P2】文档配置例子缩进差异\n入口：复制示例 YAML\n证据：键层级不同\n';
+  const a = prefix + '  ```yaml\n  parent:\n    child: 5\n  ```';
+  const b = prefix + '  ```yaml\n  parent:\n  child: 5\n  ```';
+  const distinct = f.verdict(d, '打回', ['--must-fix', a, '--remaining', b]);
+  assert.equal(distinct.code, 0, distinct.stdout);
+  assert.deepEqual(distinct.json.grades, { p0: 0, p1: 0, p2: 2 });
+});
+
+test('回归 R2-5：「通过」传入空白 --must-fix（空串/空格/换行）视同「无」正常登记，「打回」仍拒收', (t) => {
+  for (const [label, blank] of [['empty', ''], ['space', '   '], ['newline', '\n  \n']]) {
+    const f = createFixture(t, { autoMerge: false });
+    const d = f.dispatch(`pass-blank-${label}`);
+    const rej = f.verdict(d, '打回', ['--must-fix', blank]);
+    assert.equal(rej.code, 2, rej.stdout);
+    assert.equal(rej.json.code, 'MISSING_FLAG');
+
+    const ok = f.verdict(d, '通过', ['--must-fix', blank]);
+    assert.equal(ok.code, 0, `${label}: ${ok.stdout}`);
+    assert.equal(ok.json.ok, true);
+    assert.equal(ok.json.conclusion, '通过');
+    const verdictNote = f.comments().findLast((n) => n.body.includes('liteloop:verdict'));
+    assert.match(verdictNote.body, /必改项：\n无\n/);
+  }
 });
