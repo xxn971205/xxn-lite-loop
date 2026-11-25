@@ -954,6 +954,46 @@ try {
     const payload = { tool_name: 'run_command', tool_input: { CommandLine: 'git push origin main', Cwd: ACTIVE } };
     assertAntigravity(execute('/bin/sh', ['-c', command], { cwd: OUTSIDE, input: JSON.stringify(payload) }), 'deny');
   });
+  check('user-scope Antigravity auto-syncs T3 Code provider instances and preserves existing hooks', () => {
+    const t3Home = path.join(TMP, 't3-agy-home');
+    const t3InstA = path.join(t3Home, '.t3', 'userdata', 'providers', 'antigravity', 'inst-a', 'config', 'hooks.json');
+    const t3InstB = path.join(t3Home, '.t3', 'userdata', 'providers', 'antigravity', 'inst-b', 'config', 'hooks.json');
+    const geminiHooks = path.join(t3Home, '.gemini', 'config', 'hooks.json');
+    const existingT3 = {
+      'pstack-t3': { PreToolUse: [{ matcher: 'run_command', hooks: [{ type: 'command', command: 'python3 pstack-t3-hook.py antigravity' }] }] },
+      rtk: { PreToolUse: [{ matcher: 'run_command', hooks: [{ type: 'command', command: 'rtk hook antigravity' }] }] },
+    };
+    writeJson(t3InstA, existingT3);
+    fs.mkdirSync(path.dirname(t3InstB), { recursive: true });
+
+    // T3-only: auto-detects antigravity without creating ~/.gemini/config/hooks.json
+    const t3Only = execute(process.execPath, [INSTALL, '--config-dir', CONFIG], { env: { HOME: t3Home } });
+    requireExit(t3Only);
+    const t3OnlyData = requireJson(t3Only);
+    assert.deepEqual(t3OnlyData.targets.map((t) => t.file), [t3InstA, t3InstB]);
+    assert.equal(fs.existsSync(geminiHooks), false);
+    assert.deepEqual(readJson(t3InstA)['pstack-t3'], existingT3['pstack-t3']);
+    assert.deepEqual(readJson(t3InstA).rtk, existingT3.rtk);
+    assert.equal(readJson(t3InstA)['xxn-lite-loop:guard-command'].PreToolUse[0].matcher, 'run_command');
+    assert.equal(readJson(t3InstB)['xxn-lite-loop:guard-command'].PreToolUse[0].matcher, 'run_command');
+
+    // Add ~/.gemini/config: install updates gemini too while T3 instances stay idempotent
+    fs.mkdirSync(path.dirname(geminiHooks), { recursive: true });
+    const withGemini = execute(process.execPath, [INSTALL, '--target', 'antigravity', '--config-dir', CONFIG], { env: { HOME: t3Home } });
+    requireExit(withGemini);
+    const withGeminiData = requireJson(withGemini);
+    assert.deepEqual(withGeminiData.targets.map((t) => t.file), [geminiHooks, t3InstA, t3InstB]);
+    assert.equal(withGeminiData.targets[0].changed, true);
+    assert.equal(withGeminiData.targets[1].changed, false);
+    assert.equal(withGeminiData.targets[2].changed, false);
+
+    // Uninstall removes only our sentinel from all 3 files and preserves pstack-t3 / rtk
+    const removed = execute(process.execPath, [INSTALL, '--target', 'antigravity', '--uninstall'], { env: { HOME: t3Home } });
+    requireExit(removed);
+    assert.equal(fs.existsSync(geminiHooks), false);
+    assert.equal(fs.existsSync(t3InstB), false);
+    assert.deepEqual(readJson(t3InstA), existingT3);
+  });
 
   group('6. hook installer argument validation');
   const argScope = path.join(TMP, 'hook-args');

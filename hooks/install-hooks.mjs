@@ -21,8 +21,8 @@
  * 各端用户级配置路径：
  *   claude      ~/.claude/settings.json
  *   codex       ~/.codex/hooks.json
- *   antigravity ~/.gemini/config/hooks.json（插件级为 <plugin>/hooks/hooks.json；
- *               若你的 Antigravity 版本只读插件级，用 --file 指向实际文件）
+ *   antigravity ~/.gemini/config/hooks.json 与 ~/.t3/userdata/providers/antigravity/<instance>/config/hooks.json
+ *               （插件级为 <plugin>/hooks/hooks.json；指定单文件可用 --file）
  */
 
 import fs from 'node:fs';
@@ -35,6 +35,44 @@ const SENTINEL = 'xxn-lite-loop:guard-command';
 const MATCHER = 'Bash';
 const HOOK_TIMEOUT = 10;
 const GUARD_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'guard-command.mjs');
+
+function discoverT3AntigravityHookFiles() {
+  const base = path.join(os.homedir(), '.t3', 'userdata', 'providers', 'antigravity');
+  if (!fs.existsSync(base)) return [];
+  const files = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(base, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const configDir = path.join(base, entry.name, 'config');
+    try {
+      if (fs.statSync(configDir).isDirectory()) {
+        files.push(path.join(configDir, 'hooks.json'));
+      }
+    } catch {
+      // 忽略不可读或悬空的实例目录
+    }
+  }
+  return files.sort();
+}
+
+function resolveAntigravityUserFiles() {
+  const geminiConfigDir = path.join(os.homedir(), '.gemini', 'config');
+  const geminiHooks = path.join(geminiConfigDir, 'hooks.json');
+  const t3Files = discoverT3AntigravityHookFiles();
+  const candidates = [];
+  if (fs.existsSync(geminiConfigDir) || t3Files.length === 0) {
+    candidates.push(geminiHooks);
+  }
+  for (const file of t3Files) {
+    if (!candidates.includes(file)) candidates.push(file);
+  }
+  return candidates;
+}
 
 const TARGETS = {
   claude: {
@@ -52,8 +90,9 @@ const TARGETS = {
   antigravity: {
     label: 'Antigravity',
     user: () => path.join(os.homedir(), '.gemini', 'config', 'hooks.json'),
+    userFiles: () => resolveAntigravityUserFiles(),
     project: (cwd) => path.join(cwd, '.agents', 'hooks.json'),
-    detect: () => fs.existsSync(path.join(os.homedir(), '.gemini', 'config')),
+    detect: () => fs.existsSync(path.join(os.homedir(), '.gemini', 'config')) || discoverT3AntigravityHookFiles().length > 0,
   },
 };
 
@@ -212,12 +251,7 @@ function writeConfig(file, data, existed) {
   return backup;
 }
 
-function applyTarget(name, flags) {
-  const target = TARGETS[name];
-  const cwd = path.resolve(String(flags.cwd ?? process.cwd()));
-  const scope = flags.scope === undefined || flags.scope === true ? 'user' : String(flags.scope).toLowerCase();
-  if (!['user', 'project'].includes(scope)) throw new CliError('INVALID_SCOPE', `--scope 只支持 user|project，收到：${scope}`);
-  const file = flags.file ? path.resolve(String(flags.file)) : target[scope](cwd);
+function applyFile(name, target, file, scope, flags) {
   const dryRun = flags['dry-run'] === true || flags['dry-run'] === 'true';
   const uninstall = flags.uninstall === true || flags.uninstall === 'true';
 
@@ -281,6 +315,17 @@ function applyTarget(name, flags) {
   };
 }
 
+function applyTarget(name, flags) {
+  const target = TARGETS[name];
+  const cwd = path.resolve(String(flags.cwd ?? process.cwd()));
+  const scope = flags.scope === undefined || flags.scope === true ? 'user' : String(flags.scope).toLowerCase();
+  if (!['user', 'project'].includes(scope)) throw new CliError('INVALID_SCOPE', `--scope 只支持 user|project，收到：${scope}`);
+  const files = flags.file
+    ? [path.resolve(String(flags.file))]
+    : (scope === 'user' && typeof target.userFiles === 'function' ? target.userFiles() : [target[scope](cwd)]);
+  return files.map((file) => applyFile(name, target, file, scope, flags));
+}
+
 function main(argv) {
   const flags = parseArgs(argv);
   if (flags.help) {
@@ -289,7 +334,15 @@ function main(argv) {
       name: 'xxn-lite-loop/install-hooks.mjs',
       version: VERSION,
       usage: USAGE,
-      targets: Object.fromEntries(Object.entries(TARGETS).map(([name, t]) => [name, { label: t.label, user: t.user(), project: t.project(process.cwd()) }])),
+      targets: Object.fromEntries(Object.entries(TARGETS).map(([name, t]) => [
+        name,
+        {
+          label: t.label,
+          user: t.user(),
+          ...(typeof t.userFiles === 'function' ? { userFiles: t.userFiles() } : {}),
+          project: t.project(process.cwd()),
+        },
+      ])),
       sentinel: SENTINEL,
     };
   }
@@ -300,7 +353,7 @@ function main(argv) {
   if (flags.file && targets.length > 1) throw new CliError('FILE_WITH_MULTI_TARGET', '--file 只能配合单个 --target 使用');
   const dryRun = flags['dry-run'] === true || flags['dry-run'] === 'true';
   const uninstall = flags.uninstall === true || flags.uninstall === 'true';
-  const results = targets.map((name) => applyTarget(name, flags));
+  const results = targets.flatMap((name) => applyTarget(name, flags));
   const changed = results.filter((item) => item.changed);
   return {
     ok: true,
